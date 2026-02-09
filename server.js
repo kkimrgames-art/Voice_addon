@@ -28,7 +28,7 @@ const CONFIG = {
   // Rate limiting (anti-spam/attack)
   RATE_LIMIT_WINDOW: 1000,
   RATE_LIMIT_MAX: 30,
-  RATE_LIMIT_BURST: 50,
+  RATE_LIMIT_BURST: 100,
 
   // Message limits
   MAX_MESSAGE_SIZE: 32 * 1024,
@@ -285,6 +285,7 @@ class StateManager {
     this.voiceStates = new Map();
     this.activeVoiceCount = 0;
     this.gamertagIndex = new Map(); // gamertag -> ws for fast lookup
+    this.lastBroadcastTimes = new Map(); // gamertag -> timestamp
   }
 
   get connectionCount() {
@@ -429,11 +430,33 @@ class StateManager {
   updateVoiceState(gamertag, isTalking, volume) {
     try {
       const client = this.findClientByGamertag(gamertag);
-      if (client && !client.data.forceMuted) {
-        this.voiceStates.set(gamertag, {
-          isTalking: Sanitizer.boolean(isTalking),
-          volume: Sanitizer.number(volume, -100, 0)
-        });
+      if (!client || client.data.forceMuted) return false;
+
+      const oldState = this.voiceStates.get(gamertag) || { isTalking: false, volume: -100 };
+      const newTalking = Sanitizer.boolean(isTalking);
+      const newVolume = Sanitizer.number(volume, -100, 0);
+
+      // We already sanitized isTalking/volume in the handler, but we use them here.
+      // NOTE: The handler already did the type conversion for 'isTalking' and 'volume'.
+
+      const statusChanged = oldState.isTalking !== newTalking;
+      const volumeChanged = Math.abs(oldState.volume - newVolume) > 5;
+
+      const now = Date.now();
+      const lastBroadcast = this.lastBroadcastTimes.get(gamertag) || 0;
+      const throttled = (now - lastBroadcast) < 100;
+
+      // Always update internal state
+      this.voiceStates.set(gamertag, {
+        isTalking: newTalking,
+        volume: newVolume
+      });
+
+      Logger.info(`DEBUG Voice: ${gamertag} changed=${statusChanged} volChanged=${volumeChanged} throttled=${throttled}`);
+
+      // Broadcast if status changed OR volume changed significantly, but not more than once every 100ms
+      if ((statusChanged || volumeChanged) && !throttled) {
+        this.lastBroadcastTimes.set(gamertag, now);
         return true;
       }
       return false;
@@ -742,18 +765,32 @@ const MessageHandlers = {
         return;
       }
 
-      // 2. Data Validation
-      if (typeof data.isTalking !== 'boolean' || typeof data.volume !== 'number') {
+      // 2. Data Validation (Relaxed)
+      let { isTalking, volume } = data;
+
+      // Auto-convert strings if needed
+      if (typeof isTalking === 'string') isTalking = isTalking === 'true';
+      if (typeof volume === 'string') volume = parseFloat(volume);
+
+      if (typeof isTalking !== 'boolean' || typeof volume !== 'number' || isNaN(volume)) {
         Logger.warn(`Invalid voice data from ${data.gamertag}: ${JSON.stringify(data)}`);
         safeSend(ws, {
           type: 'voice-error',
-          message: 'Invalid voice data format received by server.'
+          message: 'Invalid voice data format.'
         });
         return;
       }
 
       // 3. Update State
-      stateManager.updateVoiceState(data.gamertag, data.isTalking, data.volume);
+      if (stateManager.updateVoiceState(data.gamertag, isTalking, volume)) {
+        // 4. Broadcast to others
+        broadcastToAll({
+          type: 'voice-update',
+          gamertag: data.gamertag,
+          isTalking: isTalking,
+          volume: volume
+        });
+      }
     } catch (e) {
       Logger.error('voiceDetection error', e);
     }
@@ -856,8 +893,12 @@ const MessageHandlers_Voice = {
       const client = stateManager.getClient(ws);
       if (client && client.isSuspended) return;
 
-      // 2. Data Validation
-      if (typeof data.isTalking !== 'boolean' || typeof data.volume !== 'number') {
+      // 2. Data Validation (Relaxed)
+      let { isTalking, volume } = data;
+      if (typeof isTalking === 'string') isTalking = isTalking === 'true';
+      if (typeof volume === 'string') volume = parseFloat(volume);
+
+      if (typeof isTalking !== 'boolean' || typeof volume !== 'number' || isNaN(volume)) {
         safeSend(ws, {
           type: 'voice-error',
           message: 'Invalid voice data format.'
@@ -866,7 +907,15 @@ const MessageHandlers_Voice = {
       }
 
       // 3. Update State
-      stateManager.updateVoiceState(data.gamertag, data.isTalking, data.volume);
+      if (stateManager.updateVoiceState(data.gamertag, isTalking, volume)) {
+        // 4. Broadcast to others
+        broadcastToAll({
+          type: 'voice-update',
+          gamertag: data.gamertag,
+          isTalking: isTalking,
+          volume: volume
+        });
+      }
     } catch (e) {
       Logger.error('voiceDetection error', e);
     }
@@ -969,6 +1018,7 @@ wss.on("connection", (ws, req) => {
           MessageHandlers.leave(ws);
           break;
         case 'voice-detection':
+        case 'voiceDetection':
           MessageHandlers.voiceDetection(ws, data);
           break;
         case 'ptt-status':
