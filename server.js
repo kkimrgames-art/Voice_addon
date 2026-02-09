@@ -1011,6 +1011,22 @@ const MessageHandlers = {
         minecraftData = data.players;
 
         const players = Array.isArray(data.players) ? data.players : [];
+        const config = data.config || {};
+        const maxDistance = config.maxDistance || 15;
+
+        // Helper function to calculate distance
+        const calculateDistance = (loc1, loc2) => {
+          try {
+            const dx = parseFloat(loc1.x) - parseFloat(loc2.x);
+            const dy = parseFloat(loc1.y) - parseFloat(loc2.y);
+            const dz = parseFloat(loc1.z) - parseFloat(loc2.z);
+            return Math.sqrt(dx * dx + dy * dy + dz * dz);
+          } catch {
+            return 999999;
+          }
+        };
+
+        // Update states
         for (const player of players) {
           try {
             const gamertag = player?.name;
@@ -1030,6 +1046,66 @@ const MessageHandlers = {
           } catch { }
         }
 
+        // CRITICAL FIX: Broadcast voice-update to nearby players
+        for (const talker of players) {
+          try {
+            const talkerName = talker?.name;
+            if (!talkerName) continue;
+
+            const talkerData = talker?.data || {};
+            const isTalking = Sanitizer.boolean(talkerData.isTalking);
+            const isMuted = Sanitizer.boolean(talkerData.isMuted);
+            const volume = Sanitizer.number(talkerData.voiceVolume, -100, 0);
+
+            // Check if talker is actually talking and not muted
+            if (!isTalking || isMuted) continue;
+
+            // Check if talker is force muted
+            const talkerClient = stateManager.findClientByGamertag(talkerName);
+            if (talkerClient?.data?.forceMuted) continue;
+
+            const talkerLocation = talker?.location;
+            if (!talkerLocation) continue;
+
+            // Find nearby players and send voice-update
+            for (const listener of players) {
+              try {
+                const listenerName = listener?.name;
+                if (!listenerName || listenerName === talkerName) continue;
+
+                const listenerData = listener?.data || {};
+                const isDeafened = Sanitizer.boolean(listenerData.isDeafened);
+                if (isDeafened) continue;
+
+                const listenerLocation = listener?.location;
+                if (!listenerLocation) continue;
+
+                // Calculate distance
+                const distance = calculateDistance(talkerLocation, listenerLocation);
+
+                // If within range, send voice-update
+                if (distance < maxDistance) {
+                  const listenerClient = stateManager.findClientByGamertag(listenerName);
+                  if (listenerClient && listenerClient.ws) {
+                    safeSend(listenerClient.ws, {
+                      type: 'voice-update',
+                      gamertag: talkerName,
+                      isTalking: true,
+                      volume: volume
+                    });
+                    debugLog(`voice-update sent: ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)})`);
+                  }
+                }
+              } catch (e) {
+                Logger.error(`Error broadcasting to listener`, e);
+              }
+            }
+          } catch (e) {
+            Logger.error(`Error processing talker`, e);
+          }
+        }
+
+        // Also send minecraft-update for compatibility
         const pttStatesArray = Array.from(stateManager.pttStates.entries())
           .map(([g, s]) => ({ gamertag: g, ...s }));
         const voiceStatesArray = Array.from(stateManager.voiceStates.entries())
@@ -1194,6 +1270,22 @@ app.post("/minecraft-data", (req, res) => {
     minecraftData = req.body;
 
     const players = Array.isArray(minecraftData?.players) ? minecraftData.players : [];
+    const config = minecraftData?.config || {};
+    const maxDistance = config.maxDistance || 15;
+
+    // Helper function to calculate distance
+    const calculateDistance = (loc1, loc2) => {
+      try {
+        const dx = parseFloat(loc1.x) - parseFloat(loc2.x);
+        const dy = parseFloat(loc1.y) - parseFloat(loc2.y);
+        const dz = parseFloat(loc1.z) - parseFloat(loc2.z);
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+      } catch {
+        return 999999;
+      }
+    };
+
+    // Update states
     for (const player of players) {
       try {
         const gamertag = player?.name;
@@ -1214,6 +1306,66 @@ app.post("/minecraft-data", (req, res) => {
       } catch { }
     }
 
+    // CRITICAL FIX: Broadcast voice-update to nearby players
+    for (const talker of players) {
+      try {
+        const talkerName = talker?.name;
+        if (!talkerName) continue;
+
+        const talkerData = talker?.data || {};
+        const isTalking = Sanitizer.boolean(talkerData.isTalking);
+        const isMuted = Sanitizer.boolean(talkerData.isMuted);
+        const volume = Sanitizer.number(talkerData.voiceVolume, -100, 0);
+
+        // Check if talker is actually talking and not muted
+        if (!isTalking || isMuted) continue;
+
+        // Check if talker is force muted
+        const talkerClient = stateManager.findClientByGamertag(talkerName);
+        if (talkerClient?.data?.forceMuted) continue;
+
+        const talkerLocation = talker?.location;
+        if (!talkerLocation) continue;
+
+        // Find nearby players and send voice-update
+        for (const listener of players) {
+          try {
+            const listenerName = listener?.name;
+            if (!listenerName || listenerName === talkerName) continue;
+
+            const listenerData = listener?.data || {};
+            const isDeafened = Sanitizer.boolean(listenerData.isDeafened);
+            if (isDeafened) continue;
+
+            const listenerLocation = listener?.location;
+            if (!listenerLocation) continue;
+
+            // Calculate distance
+            const distance = calculateDistance(talkerLocation, listenerLocation);
+
+            // If within range, send voice-update
+            if (distance < maxDistance) {
+              const listenerClient = stateManager.findClientByGamertag(listenerName);
+              if (listenerClient && listenerClient.ws) {
+                safeSend(listenerClient.ws, {
+                  type: 'voice-update',
+                  gamertag: talkerName,
+                  isTalking: true,
+                  volume: volume
+                });
+                debugLog(`voice-update sent: ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)})`);
+              }
+            }
+          } catch (e) {
+            Logger.error(`Error broadcasting to listener`, e);
+          }
+        }
+      } catch (e) {
+        Logger.error(`Error processing talker`, e);
+      }
+    }
+
+    // Also send minecraft-update for compatibility
     const pttStatesArray = Array.from(stateManager.pttStates.entries())
       .map(([g, s]) => ({ gamertag: g, ...s }));
     const voiceStatesArray = Array.from(stateManager.voiceStates.entries())
