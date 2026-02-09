@@ -452,8 +452,6 @@ class StateManager {
         volume: newVolume
       });
 
-      Logger.info(`DEBUG Voice: ${gamertag} changed=${statusChanged} volChanged=${volumeChanged} throttled=${throttled}`);
-
       // Broadcast if status changed OR volume changed significantly, but not more than once every 100ms
       if ((statusChanged || volumeChanged) && !throttled) {
         this.lastBroadcastTimes.set(gamertag, now);
@@ -760,149 +758,14 @@ const MessageHandlers = {
     try {
       // 1. Suspension Check
       const client = stateManager.getClient(ws);
-      if (client && client.isSuspended) {
-        // Optional: Send "You are muted" reminder if they try to talk
-        return;
-      }
-
-      // 2. Data Validation (Relaxed)
-      let { isTalking, volume } = data;
-
-      // Auto-convert strings if needed
-      if (typeof isTalking === 'string') isTalking = isTalking === 'true';
-      if (typeof volume === 'string') volume = parseFloat(volume);
-
-      if (typeof isTalking !== 'boolean' || typeof volume !== 'number' || isNaN(volume)) {
-        Logger.warn(`Invalid voice data from ${data.gamertag}: ${JSON.stringify(data)}`);
-        safeSend(ws, {
-          type: 'voice-error',
-          message: 'Invalid voice data format.'
-        });
-        return;
-      }
-
-      // 3. Update State
-      if (stateManager.updateVoiceState(data.gamertag, isTalking, volume)) {
-        // 4. Broadcast to others
-        broadcastToAll({
-          type: 'voice-update',
-          gamertag: data.gamertag,
-          isTalking: isTalking,
-          volume: volume
-        });
-      }
-    } catch (e) {
-      Logger.error('voiceDetection error', e);
-    }
-  },
-
-  pttStatus(ws, data) {
-    try {
-      if (stateManager.updatePttState(data.gamertag, data.isTalking, data.isMuted)) {
-        broadcastToAll({
-          type: 'ptt-update',
-          gamertag: data.gamertag,
-          isTalking: Sanitizer.boolean(data.isTalking),
-          isMuted: Sanitizer.boolean(data.isMuted)
-        });
-      }
-    } catch (e) {
-      Logger.error('pttStatus error', e);
-    }
-  },
-
-  webrtcSignaling(ws, data) {
-    try {
-      if (!data.to || !data.from) return;
-      const target = stateManager.findClientByGamertag(data.to);
-      if (target) {
-        safeSend(target.ws, data);
-      }
-    } catch (e) {
-      Logger.error('webrtcSignaling error', e);
-    }
-  },
-
-  heartbeat(ws) {
-    safeSend(ws, { type: 'heartbeat-ack' });
-  },
-
-  requestParticipants(ws) {
-    safeSend(ws, {
-      type: 'participants-list',
-      list: stateManager.getParticipants()
-    });
-  },
-
-  async checkAccess(ws, data) {
-    try {
-      if (!CONFIG.TOKEN_VALIDATION_ENABLED) return;
-
-      const token = data.token || ws._accessToken;
-      if (!token) return;
-
-      const validation = await validateToken(token);
-
-      const client = stateManager.getClient(ws);
-      if (!client) return;
-
-      const wasSuspended = client.isSuspended;
-      const isNowSuspended = validation.valid && validation.suspended;
-
-      // Update state
-      if (client.isSuspended !== isNowSuspended) {
-        client.isSuspended = isNowSuspended;
-        client.voiceActive = !isNowSuspended && stateManager.canActivateVoice();
-        client.forceMuted = isNowSuspended || !client.voiceActive;
-
-        Logger.info(`Access status changed for ${client.gamertag}: suspended=${wasSuspended}->${isNowSuspended}`);
-
-        if (wasSuspended && !isNowSuspended) {
-          // RESTORED
-          safeSend(ws, {
-            type: 'access-restored',
-            message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
-          });
-
-          // Broadcast update so others see him unmuted
-          broadcast(ws, { type: 'join', gamertag: client.gamertag, voiceActive: client.voiceActive });
-          broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
-
-        } else if (!wasSuspended && isNowSuspended) {
-          // SUSPENDED
-          safeSend(ws, {
-            type: 'access-suspended',
-            message: validation.message || 'انتهت صلاحية الوصول المجاني.'
-          });
-
-          broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
-        }
-      }
-    } catch (e) {
-      Logger.error('checkAccess error', e);
-    }
-  }
-};
-
-// ... existing code ...
-
-const MessageHandlers_Voice = {
-  voiceDetection(ws, data) {
-    try {
-      // 1. Suspension Check
-      const client = stateManager.getClient(ws);
       if (client && client.isSuspended) return;
 
-      // 2. Data Validation (Relaxed)
+      // 2. Data Validation
       let { isTalking, volume } = data;
       if (typeof isTalking === 'string') isTalking = isTalking === 'true';
       if (typeof volume === 'string') volume = parseFloat(volume);
 
       if (typeof isTalking !== 'boolean' || typeof volume !== 'number' || isNaN(volume)) {
-        safeSend(ws, {
-          type: 'voice-error',
-          message: 'Invalid voice data format.'
-        });
         return;
       }
 
@@ -942,25 +805,140 @@ const MessageHandlers_Voice = {
 
   webrtcSignaling(ws, data) {
     try {
-      // Block signaling if suspended (cant speak/hear)
+      // Block signaling if suspended
       const client = stateManager.getClient(ws);
       if (client && client.isSuspended) return;
 
       if (!data.to || !data.from) return;
       const target = stateManager.findClientByGamertag(data.to);
       if (target) {
-        // Also don't send TO suspended users? typically yes
-        // if (target.data.isSuspended) return; 
         safeSend(target.ws, data);
       }
     } catch (e) {
       Logger.error('webrtcSignaling error', e);
     }
+  },
+
+  heartbeat(ws) {
+    safeSend(ws, { type: 'heartbeat-ack' });
+  },
+
+  requestParticipants(ws) {
+    safeSend(ws, {
+      type: 'participants-list',
+      list: stateManager.getParticipants()
+    });
+  },
+
+  async checkAccess(ws, data) {
+    try {
+      if (!CONFIG.TOKEN_VALIDATION_ENABLED) return;
+
+      const token = data.token || ws._accessToken;
+      if (!token) return;
+
+      const validation = await validateToken(token);
+
+      const client = stateManager.getClient(ws);
+      if (!client) return;
+
+      const wasSuspended = client.isSuspended;
+      const isNowSuspended = validation.valid && validation.suspended;
+
+      if (client.isSuspended !== isNowSuspended) {
+        client.isSuspended = isNowSuspended;
+        client.voiceActive = !isNowSuspended && stateManager.canActivateVoice();
+        client.forceMuted = isNowSuspended || !client.voiceActive;
+
+        Logger.info(`Access status changed for ${client.gamertag}: suspended=${wasSuspended}->${isNowSuspended}`);
+
+        if (wasSuspended && !isNowSuspended) {
+          safeSend(ws, {
+            type: 'access-restored',
+            message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
+          });
+          broadcast(ws, { type: 'join', gamertag: client.gamertag, voiceActive: client.voiceActive });
+          broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+        } else if (!wasSuspended && isNowSuspended) {
+          safeSend(ws, {
+            type: 'access-suspended',
+            message: validation.message || 'انتهت صلاحية الوصول المجاني.'
+          });
+          broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+        }
+      }
+    } catch (e) {
+      Logger.error('checkAccess error', e);
+    }
+  },
+
+  async adminCommand(ws, data) {
+    try {
+      const token = data.token || ws._accessToken;
+      if (!token) return;
+
+      // Verify admin via Supabase
+      const response = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/is_admin`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': CONFIG.SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      const isAdmin = await response.json();
+      if (!isAdmin) {
+        Logger.warn(`Unauthorized admin command from token: ${token.substring(0, 10)}...`);
+        return;
+      }
+
+      const { command, target, reason } = data;
+      Logger.info(`Admin Command: ${command} on ${target} (${reason || 'No reason'})`);
+
+      const targetClient = stateManager.findClientByGamertag(target);
+
+      switch (command) {
+        case 'kick':
+          if (targetClient) {
+            safeSend(targetClient.ws, { type: 'error', code: 'KICKED', message: `تم طردك من المحادثة: ${reason || 'غير محدد'}` });
+            targetClient.ws.close(1008, 'Kicked by admin');
+          }
+          break;
+        case 'mute':
+          if (targetClient) {
+            targetClient.data.forceMuted = true;
+            targetClient.data.voiceActive = false;
+            safeSend(targetClient.ws, { type: 'mute-notification', muted: true, reason });
+            broadcastToAll({ type: 'participants-list', list: stateManager.getParticipants(), detailed: stateManager.getParticipantsWithStatus() });
+          }
+          break;
+        case 'unmute':
+          if (targetClient) {
+            targetClient.data.forceMuted = false;
+            targetClient.data.voiceActive = true;
+            safeSend(targetClient.ws, { type: 'mute-notification', muted: false });
+            broadcastToAll({ type: 'participants-list', list: stateManager.getParticipants(), detailed: stateManager.getParticipantsWithStatus() });
+          }
+          break;
+        case 'broadcast':
+          broadcastToAll({ type: 'admin-broadcast', message: reason || 'تنبيه من المسؤول' });
+          break;
+      }
+    } catch (e) {
+      Logger.error('adminCommand error', e);
+    }
+  },
+
+  shortenLink(ws, data) {
+    // Provide target link for shortening
+    safeSend(ws, {
+      type: 'shortening-info',
+      targetUrl: 'https://linkjust.com/ref/your_id', // This should be dynamic or from CONFIG
+      instruction: 'اختصر هذا الرابط لتتمكن من التحدث لمدة 48 ساعة.'
+    });
   }
 };
-
-// Merge for the main object
-Object.assign(MessageHandlers, MessageHandlers_Voice);
 
 // =====================================================
 // WEBSOCKET CONNECTION HANDLER
@@ -1037,6 +1015,14 @@ wss.on("connection", (ws, req) => {
           break;
         case 'check-access':
           MessageHandlers.checkAccess(ws, data);
+          break;
+        case 'admin-command':
+        case 'adminCommand':
+          MessageHandlers.adminCommand(ws, data);
+          break;
+        case 'shorten-link':
+        case 'shortenLink':
+          MessageHandlers.shortenLink(ws, data);
           break;
         default:
           // Ignore unknown types silently
