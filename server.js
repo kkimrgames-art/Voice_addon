@@ -1180,19 +1180,26 @@ const MessageHandlers = {
                 // If within range, send voice-update
                 if (distance < maxDistance) {
                   const listenerClient = stateManager.findClientByGamertag(listenerName);
+                  
+                  // Always queue the message for HTTP polling
+                  const voiceMessage = {
+                    type: 'voice-update',
+                    gamertag: talkerName,
+                    isTalking: true,
+                    volume: volume
+                  };
+                  
+                  // Queue for HTTP polling (even if not connected via WebSocket)
+                  queueMessage(listenerName, voiceMessage);
+                  
+                  // Also send via WebSocket if connected
                   if (listenerClient && listenerClient.ws) {
-                    safeSendWithQueue(listenerClient.ws, listenerName, {
-                      type: 'voice-update',
-                      gamertag: talkerName,
-                      isTalking: true,
-                      volume: volume
-                    });
-                    listenersCount++;
-                    voiceBroadcastCount++;
-                    Logger.success(`   ✅ [VOICE] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
-                  } else {
-                    Logger.warn(`   ⚠️ [VOICE] ${listenerName} client not found or disconnected`);
+                    safeSend(listenerClient.ws, voiceMessage);
                   }
+                  
+                  listenersCount++;
+                  voiceBroadcastCount++;
+                  Logger.success(`   ✅ [VOICE] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
                 } else {
                   Logger.info(`   📏 [VOICE] ${listenerName} too far (${distance.toFixed(1)} > ${maxDistance} blocks)`);
                 }
@@ -1474,19 +1481,26 @@ app.post("/minecraft-data", (req, res) => {
             // If within range, send voice-update
             if (distance < maxDistance) {
               const listenerClient = stateManager.findClientByGamertag(listenerName);
+              
+              // Always queue the message for HTTP polling
+              const voiceMessage = {
+                type: 'voice-update',
+                gamertag: talkerName,
+                isTalking: true,
+                volume: volume
+              };
+              
+              // Queue for HTTP polling (even if not connected via WebSocket)
+              queueMessage(listenerName, voiceMessage);
+              
+              // Also send via WebSocket if connected
               if (listenerClient && listenerClient.ws) {
-                safeSendWithQueue(listenerClient.ws, listenerName, {
-                  type: 'voice-update',
-                  gamertag: talkerName,
-                  isTalking: true,
-                  volume: volume
-                });
-                listenersCount++;
-                voiceBroadcastCount++;
-                Logger.success(`   ✅ [VOICE-HTTP] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
-              } else {
-                Logger.warn(`   ⚠️ [VOICE-HTTP] ${listenerName} client not found or disconnected`);
+                safeSend(listenerClient.ws, voiceMessage);
               }
+              
+              listenersCount++;
+              voiceBroadcastCount++;
+              Logger.success(`   ✅ [VOICE-HTTP] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
             } else {
               Logger.info(`   📏 [VOICE-HTTP] ${listenerName} too far (${distance.toFixed(1)} > ${maxDistance} blocks)`);
             }
