@@ -735,8 +735,28 @@ const MessageHandlers = {
 
   voiceDetection(ws, data) {
     try {
+      // 1. Suspension Check
+      const client = stateManager.getClient(ws);
+      if (client && client.isSuspended) {
+        // Optional: Send "You are muted" reminder if they try to talk
+        return;
+      }
+
+      // 2. Data Validation
+      if (typeof data.isTalking !== 'boolean' || typeof data.volume !== 'number') {
+        Logger.warn(`Invalid voice data from ${data.gamertag}: ${JSON.stringify(data)}`);
+        safeSend(ws, {
+          type: 'voice-error',
+          message: 'Invalid voice data format received by server.'
+        });
+        return;
+      }
+
+      // 3. Update State
       stateManager.updateVoiceState(data.gamertag, data.isTalking, data.volume);
-    } catch { }
+    } catch (e) {
+      Logger.error('voiceDetection error', e);
+    }
   },
 
   pttStatus(ws, data) {
@@ -832,12 +852,24 @@ const MessageHandlers = {
 const MessageHandlers_Voice = {
   voiceDetection(ws, data) {
     try {
-      // Ignore if suspended
+      // 1. Suspension Check
       const client = stateManager.getClient(ws);
       if (client && client.isSuspended) return;
 
+      // 2. Data Validation
+      if (typeof data.isTalking !== 'boolean' || typeof data.volume !== 'number') {
+        safeSend(ws, {
+          type: 'voice-error',
+          message: 'Invalid voice data format.'
+        });
+        return;
+      }
+
+      // 3. Update State
       stateManager.updateVoiceState(data.gamertag, data.isTalking, data.volume);
-    } catch { }
+    } catch (e) {
+      Logger.error('voiceDetection error', e);
+    }
   },
 
   pttStatus(ws, data) {
