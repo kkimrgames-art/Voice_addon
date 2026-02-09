@@ -1047,6 +1047,7 @@ const MessageHandlers = {
         }
 
         // CRITICAL FIX: Broadcast voice-update to nearby players
+        let voiceBroadcastCount = 0;
         for (const talker of players) {
           try {
             const talkerName = talker?.name;
@@ -1057,17 +1058,31 @@ const MessageHandlers = {
             const isMuted = Sanitizer.boolean(talkerData.isMuted);
             const volume = Sanitizer.number(talkerData.voiceVolume, -100, 0);
 
+            // Log talker status
+            if (isTalking) {
+              Logger.info(`🎤 [VOICE] ${talkerName} is talking (volume: ${volume}dB, muted: ${isMuted})`);
+            }
+
             // Check if talker is actually talking and not muted
             if (!isTalking || isMuted) continue;
 
             // Check if talker is force muted
             const talkerClient = stateManager.findClientByGamertag(talkerName);
-            if (talkerClient?.data?.forceMuted) continue;
+            if (talkerClient?.data?.forceMuted) {
+              Logger.warn(`⚠️ [VOICE] ${talkerName} is force-muted, skipping broadcast`);
+              continue;
+            }
 
             const talkerLocation = talker?.location;
-            if (!talkerLocation) continue;
+            if (!talkerLocation) {
+              Logger.warn(`⚠️ [VOICE] ${talkerName} has no location, skipping`);
+              continue;
+            }
+
+            Logger.info(`📡 [VOICE] Broadcasting ${talkerName}'s voice to nearby players...`);
 
             // Find nearby players and send voice-update
+            let listenersCount = 0;
             for (const listener of players) {
               try {
                 const listenerName = listener?.name;
@@ -1075,7 +1090,10 @@ const MessageHandlers = {
 
                 const listenerData = listener?.data || {};
                 const isDeafened = Sanitizer.boolean(listenerData.isDeafened);
-                if (isDeafened) continue;
+                if (isDeafened) {
+                  Logger.info(`   🔇 [VOICE] ${listenerName} is deafened, skipping`);
+                  continue;
+                }
 
                 const listenerLocation = listener?.location;
                 if (!listenerLocation) continue;
@@ -1093,16 +1111,32 @@ const MessageHandlers = {
                       isTalking: true,
                       volume: volume
                     });
-                    debugLog(`voice-update sent: ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)})`);
+                    listenersCount++;
+                    voiceBroadcastCount++;
+                    Logger.success(`   ✅ [VOICE] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
+                  } else {
+                    Logger.warn(`   ⚠️ [VOICE] ${listenerName} client not found or disconnected`);
                   }
+                } else {
+                  Logger.info(`   📏 [VOICE] ${listenerName} too far (${distance.toFixed(1)} > ${maxDistance} blocks)`);
                 }
               } catch (e) {
                 Logger.error(`Error broadcasting to listener`, e);
               }
             }
+            
+            if (listenersCount > 0) {
+              Logger.success(`🔊 [VOICE] ${talkerName} voice sent to ${listenersCount} listener(s)`);
+            } else {
+              Logger.warn(`⚠️ [VOICE] ${talkerName} has no listeners nearby`);
+            }
           } catch (e) {
             Logger.error(`Error processing talker`, e);
           }
+        }
+        
+        if (voiceBroadcastCount > 0) {
+          Logger.success(`📊 [VOICE] Total voice broadcasts: ${voiceBroadcastCount}`);
         }
 
         // Also send minecraft-update for compatibility
@@ -1307,6 +1341,7 @@ app.post("/minecraft-data", (req, res) => {
     }
 
     // CRITICAL FIX: Broadcast voice-update to nearby players
+    let voiceBroadcastCount = 0;
     for (const talker of players) {
       try {
         const talkerName = talker?.name;
@@ -1317,17 +1352,31 @@ app.post("/minecraft-data", (req, res) => {
         const isMuted = Sanitizer.boolean(talkerData.isMuted);
         const volume = Sanitizer.number(talkerData.voiceVolume, -100, 0);
 
+        // Log talker status
+        if (isTalking) {
+          Logger.info(`🎤 [VOICE-HTTP] ${talkerName} is talking (volume: ${volume}dB, muted: ${isMuted})`);
+        }
+
         // Check if talker is actually talking and not muted
         if (!isTalking || isMuted) continue;
 
         // Check if talker is force muted
         const talkerClient = stateManager.findClientByGamertag(talkerName);
-        if (talkerClient?.data?.forceMuted) continue;
+        if (talkerClient?.data?.forceMuted) {
+          Logger.warn(`⚠️ [VOICE-HTTP] ${talkerName} is force-muted, skipping broadcast`);
+          continue;
+        }
 
         const talkerLocation = talker?.location;
-        if (!talkerLocation) continue;
+        if (!talkerLocation) {
+          Logger.warn(`⚠️ [VOICE-HTTP] ${talkerName} has no location, skipping`);
+          continue;
+        }
+
+        Logger.info(`📡 [VOICE-HTTP] Broadcasting ${talkerName}'s voice to nearby players...`);
 
         // Find nearby players and send voice-update
+        let listenersCount = 0;
         for (const listener of players) {
           try {
             const listenerName = listener?.name;
@@ -1335,7 +1384,10 @@ app.post("/minecraft-data", (req, res) => {
 
             const listenerData = listener?.data || {};
             const isDeafened = Sanitizer.boolean(listenerData.isDeafened);
-            if (isDeafened) continue;
+            if (isDeafened) {
+              Logger.info(`   🔇 [VOICE-HTTP] ${listenerName} is deafened, skipping`);
+              continue;
+            }
 
             const listenerLocation = listener?.location;
             if (!listenerLocation) continue;
@@ -1353,16 +1405,32 @@ app.post("/minecraft-data", (req, res) => {
                   isTalking: true,
                   volume: volume
                 });
-                debugLog(`voice-update sent: ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)})`);
+                listenersCount++;
+                voiceBroadcastCount++;
+                Logger.success(`   ✅ [VOICE-HTTP] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
+              } else {
+                Logger.warn(`   ⚠️ [VOICE-HTTP] ${listenerName} client not found or disconnected`);
               }
+            } else {
+              Logger.info(`   📏 [VOICE-HTTP] ${listenerName} too far (${distance.toFixed(1)} > ${maxDistance} blocks)`);
             }
           } catch (e) {
             Logger.error(`Error broadcasting to listener`, e);
           }
         }
+        
+        if (listenersCount > 0) {
+          Logger.success(`🔊 [VOICE-HTTP] ${talkerName} voice sent to ${listenersCount} listener(s)`);
+        } else {
+          Logger.warn(`⚠️ [VOICE-HTTP] ${talkerName} has no listeners nearby`);
+        }
       } catch (e) {
         Logger.error(`Error processing talker`, e);
       }
+    }
+    
+    if (voiceBroadcastCount > 0) {
+      Logger.success(`📊 [VOICE-HTTP] Total voice broadcasts: ${voiceBroadcastCount}`);
     }
 
     // Also send minecraft-update for compatibility
