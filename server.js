@@ -18,6 +18,58 @@ const { WebSocketServer } = require("ws");
 let minecraftData = null;
 
 // =====================================================
+// MESSAGE QUEUE FOR HTTP POLLING
+// =====================================================
+const messageQueues = new Map();  // gamertag -> messages[]
+const MAX_QUEUE_SIZE = 50;  // Maximum messages per player
+const QUEUE_CLEANUP_INTERVAL = 30000;  // Clean old queues every 30s
+
+// Add message to player's queue
+function queueMessage(gamertag, message) {
+  try {
+    if (!gamertag || typeof gamertag !== 'string') return;
+    
+    if (!messageQueues.has(gamertag)) {
+      messageQueues.set(gamertag, []);
+    }
+    
+    const queue = messageQueues.get(gamertag);
+    queue.push({
+      ...message,
+      timestamp: Date.now()
+    });
+    
+    // Limit queue size
+    if (queue.length > MAX_QUEUE_SIZE) {
+      queue.shift();  // Remove oldest
+    }
+  } catch (e) {
+    Logger.error(`Failed to queue message for ${gamertag}`, e);
+  }
+}
+
+// Clean up old message queues
+setInterval(() => {
+  try {
+    const now = Date.now();
+    const maxAge = 60000;  // 60 seconds
+    
+    for (const [gamertag, queue] of messageQueues.entries()) {
+      // Remove messages older than maxAge
+      const filtered = queue.filter(msg => (now - msg.timestamp) < maxAge);
+      
+      if (filtered.length === 0) {
+        messageQueues.delete(gamertag);
+      } else {
+        messageQueues.set(gamertag, filtered);
+      }
+    }
+  } catch (e) {
+    Logger.error('Failed to clean message queues', e);
+  }
+}, QUEUE_CLEANUP_INTERVAL);
+
+// =====================================================
 // CONFIGURATION
 // =====================================================
 const CONFIG = {
@@ -618,6 +670,30 @@ function safeSend(ws, message) {
   return false;
 }
 
+// Send via WebSocket AND queue for HTTP polling
+function safeSendWithQueue(ws, gamertag, message) {
+  try {
+    // Send via WebSocket if connected
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify(message));
+    }
+    
+    // Also queue for HTTP polling
+    if (gamertag) {
+      queueMessage(gamertag, message);
+    }
+    
+    return true;
+  } catch (e) {
+    Logger.error('safeSendWithQueue error', e);
+    try {
+      debugLog(`safeSendWithQueue failed to=${gamertag || 'unknown'} type=${message?.type || 'unknown'} err=${e?.message || e}`);
+    } catch {
+    }
+  }
+  return false;
+}
+
 function broadcast(senderWs, message) {
   try {
     const msg = JSON.stringify(message);
@@ -1105,7 +1181,7 @@ const MessageHandlers = {
                 if (distance < maxDistance) {
                   const listenerClient = stateManager.findClientByGamertag(listenerName);
                   if (listenerClient && listenerClient.ws) {
-                    safeSend(listenerClient.ws, {
+                    safeSendWithQueue(listenerClient.ws, listenerName, {
                       type: 'voice-update',
                       gamertag: talkerName,
                       isTalking: true,
@@ -1399,7 +1475,7 @@ app.post("/minecraft-data", (req, res) => {
             if (distance < maxDistance) {
               const listenerClient = stateManager.findClientByGamertag(listenerName);
               if (listenerClient && listenerClient.ws) {
-                safeSend(listenerClient.ws, {
+                safeSendWithQueue(listenerClient.ws, listenerName, {
                   type: 'voice-update',
                   gamertag: talkerName,
                   isTalking: true,
@@ -1475,6 +1551,36 @@ app.get("/health", (req, res) => {
   } catch (e) {
     Logger.error('health error', e);
     res.status(500).json({ status: 'error' });
+  }
+});
+
+// HTTP Polling endpoint for Minecraft Bedrock (no WebSocket support)
+app.get("/poll/:gamertag", (req, res) => {
+  try {
+    const gamertag = req.params.gamertag;
+    
+    if (!gamertag || typeof gamertag !== 'string') {
+      return res.status(400).json({ error: 'Invalid gamertag' });
+    }
+    
+    // Get messages from queue
+    const messages = messageQueues.get(gamertag) || [];
+    
+    // Clear queue after reading
+    messageQueues.delete(gamertag);
+    
+    // Remove timestamp from messages before sending
+    const cleanMessages = messages.map(msg => {
+      const { timestamp, ...rest } = msg;
+      return rest;
+    });
+    
+    Logger.info(`📥 [POLL] ${gamertag} polled, ${cleanMessages.length} message(s)`);
+    
+    res.json(cleanMessages);
+  } catch (e) {
+    Logger.error('poll error', e);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
