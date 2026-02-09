@@ -13,12 +13,20 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 // =====================================================
+// GLOBAL STATE (Emergency accessible)
+// =====================================================
+let minecraftData = null;
+
+// =====================================================
 // CONFIGURATION
 // =====================================================
 const CONFIG = {
   // Connection limits
   MAX_CONNECTIONS: parseInt(process.env.MAX_CONNECTIONS) || 50,
   MAX_VOICE_ACTIVE: 50,
+
+  // Debug logging
+  DEBUG_LOGS: process.env.DEBUG_LOGS === 'true',
 
   // Memory limits (Render free tier = 100MB)
   MEMORY_LIMIT_MB: 90,
@@ -66,6 +74,15 @@ const Logger = {
   },
   success: function (msg) { this._safe(() => console.log(`[${this._time()}] ✅ ${msg}`)); }
 };
+
+function debugLog(msg) {
+  try {
+    if (CONFIG.DEBUG_LOGS) {
+      Logger.info(`DEBUG ${msg}`);
+    }
+  } catch {
+  }
+}
 
 // =====================================================
 // ERROR HANDLER (Catch all unhandled errors)
@@ -556,6 +573,24 @@ app.use((req, res, next) => {
   }
 });
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    memory: memoryMonitor.check(),
+    connections: stateManager.getStats()
+  });
+});
+
+// Version endpoint
+app.get('/version', (req, res) => {
+  res.json({
+    version: '4.0.1-resilient',
+    uptime: process.uptime(),
+    node: process.version
+  });
+});
+
 // =====================================================
 // WEBSOCKET SERVER (Ultra-resilient)
 // =====================================================
@@ -574,6 +609,11 @@ function safeSend(ws, message) {
     }
   } catch (e) {
     Logger.error('safeSend error', e);
+    try {
+      const client = stateManager.getClient(ws);
+      debugLog(`safeSend failed to=${client?.gamertag || 'unknown'} type=${message?.type || 'unknown'} err=${e?.message || e}`);
+    } catch {
+    }
   }
   return false;
 }
@@ -583,7 +623,15 @@ function broadcast(senderWs, message) {
     const msg = JSON.stringify(message);
     for (const client of wss.clients) {
       if (client !== senderWs && client.readyState === 1) {
-        try { client.send(msg); } catch { }
+        try {
+          client.send(msg);
+        } catch (e) {
+          try {
+            const toClient = stateManager.getClient(client);
+            debugLog(`broadcast failed to=${toClient?.gamertag || 'unknown'} type=${message?.type || 'unknown'} err=${e?.message || e}`);
+          } catch {
+          }
+        }
       }
     }
   } catch (e) {
@@ -596,7 +644,15 @@ function broadcastToAll(message) {
     const msg = JSON.stringify(message);
     for (const client of wss.clients) {
       if (client.readyState === 1) {
-        try { client.send(msg); } catch { }
+        try {
+          client.send(msg);
+        } catch (e) {
+          try {
+            const toClient = stateManager.getClient(client);
+            debugLog(`broadcastToAll failed to=${toClient?.gamertag || 'unknown'} type=${message?.type || 'unknown'} err=${e?.message || e}`);
+          } catch {
+          }
+        }
       }
     }
   } catch (e) {
@@ -638,8 +694,15 @@ async function validateToken(token) {
 
       clearTimeout(timeout);
 
-      if (!response.ok) return { valid: false, error: 'Validation failed' };
-      return await response.json();
+      if (!response.ok) {
+        Logger.warn(`Token validation failed for token: ${token.substring(0, 8)}... - Status: ${response.status}`);
+        return { valid: false, error: 'Validation failed' };
+      }
+      const valResponse = await response.json();
+      if (!valResponse.valid) {
+        Logger.warn(`Token rejected by Supabase: ${token.substring(0, 8)}... - Reason: ${valResponse.error || valResponse.message || 'Unknown'}`);
+      }
+      return valResponse;
     } catch (e) {
       clearTimeout(timeout);
       throw e;
@@ -812,7 +875,10 @@ const MessageHandlers = {
       if (!data.to || !data.from) return;
       const target = stateManager.findClientByGamertag(data.to);
       if (target) {
+        debugLog(`signal type=${data.type} from=${data.from} to=${data.to}`);
         safeSend(target.ws, data);
+      } else {
+        debugLog(`signal drop type=${data.type} from=${data.from} to=${data.to} reason=target_not_found`);
       }
     } catch (e) {
       Logger.error('webrtcSignaling error', e);
@@ -937,6 +1003,48 @@ const MessageHandlers = {
       targetUrl: 'https://linkjust.com/ref/your_id', // This should be dynamic or from CONFIG
       instruction: 'اختصر هذا الرابط لتتمكن من التحدث لمدة 48 ساعة.'
     });
+  },
+
+  minecraftData(ws, data) {
+    try {
+      if (data.players) {
+        minecraftData = data.players;
+
+        const players = Array.isArray(data.players) ? data.players : [];
+        for (const player of players) {
+          try {
+            const gamertag = player?.name;
+            if (!gamertag) continue;
+            const pData = player?.data || {};
+            const clientInfo = stateManager.findClientByGamertag(gamertag);
+            if (clientInfo?.data?.forceMuted) continue;
+
+            stateManager.pttStates.set(gamertag, {
+              isTalking: Sanitizer.boolean(pData.isTalking),
+              isMuted: Sanitizer.boolean(pData.isMuted)
+            });
+            stateManager.voiceStates.set(gamertag, {
+              isTalking: Sanitizer.boolean(pData.isTalking),
+              volume: Sanitizer.number(pData.voiceVolume, -100, 0)
+            });
+          } catch { }
+        }
+
+        const pttStatesArray = Array.from(stateManager.pttStates.entries())
+          .map(([g, s]) => ({ gamertag: g, ...s }));
+        const voiceStatesArray = Array.from(stateManager.voiceStates.entries())
+          .map(([g, s]) => ({ gamertag: g, ...s }));
+
+        broadcastToAll({
+          type: 'minecraft-update',
+          data: minecraftData,
+          pttStates: pttStatesArray,
+          voiceStates: voiceStatesArray
+        });
+      }
+    } catch (e) {
+      Logger.error('minecraftData WS error', e);
+    }
   }
 };
 
@@ -946,6 +1054,11 @@ const MessageHandlers = {
 wss.on("connection", (ws, req) => {
   let gamertag = null;
   let clientId = `c_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+
+  try {
+    debugLog(`connection open id=${clientId} ip=${req?.socket?.remoteAddress || 'unknown'}`);
+  } catch {
+  }
 
   try {
     // Capacity check
@@ -986,6 +1099,17 @@ wss.on("connection", (ws, req) => {
       const data = Sanitizer.message(JSON.parse(msg.toString()));
       if (!data) return;
 
+      try {
+        if (CONFIG.DEBUG_LOGS) {
+          const sender = stateManager.getClient(ws);
+          const from = data.from || data.gamertag || sender?.gamertag || gamertag || clientId;
+          const to = data.to || '';
+          const t = data.type || 'unknown';
+          debugLog(`rx type=${t} from=${from}${to ? ` to=${to}` : ''}`);
+        }
+      } catch {
+      }
+
       // Route to handler
       switch (data.type) {
         case 'join':
@@ -1024,6 +1148,10 @@ wss.on("connection", (ws, req) => {
         case 'shortenLink':
           MessageHandlers.shortenLink(ws, data);
           break;
+        case 'minecraft-data':
+        case 'minecraftData':
+          MessageHandlers.minecraftData(ws, data);
+          break;
         default:
           // Ignore unknown types silently
           break;
@@ -1036,6 +1164,10 @@ wss.on("connection", (ws, req) => {
   // Disconnect
   ws.on('close', () => {
     try {
+      try {
+        debugLog(`connection close id=${clientId} tag=${gamertag || 'unknown'}`);
+      } catch {
+      }
       MessageHandlers.leave(ws);
     } catch { }
   });
@@ -1056,7 +1188,6 @@ wss.on('error', (err) => {
 // =====================================================
 // HTTP ENDPOINTS
 // =====================================================
-let minecraftData = null;
 
 app.post("/minecraft-data", (req, res) => {
   try {
