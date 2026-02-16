@@ -28,17 +28,17 @@ const QUEUE_CLEANUP_INTERVAL = 30000;  // Clean old queues every 30s
 function queueMessage(gamertag, message) {
   try {
     if (!gamertag || typeof gamertag !== 'string') return;
-    
+
     if (!messageQueues.has(gamertag)) {
       messageQueues.set(gamertag, []);
     }
-    
+
     const queue = messageQueues.get(gamertag);
     queue.push({
       ...message,
       timestamp: Date.now()
     });
-    
+
     // Limit queue size
     if (queue.length > MAX_QUEUE_SIZE) {
       queue.shift();  // Remove oldest
@@ -53,11 +53,11 @@ setInterval(() => {
   try {
     const now = Date.now();
     const maxAge = 60000;  // 60 seconds
-    
+
     for (const [gamertag, queue] of messageQueues.entries()) {
       // Remove messages older than maxAge
       const filtered = queue.filter(msg => (now - msg.timestamp) < maxAge);
-      
+
       if (filtered.length === 0) {
         messageQueues.delete(gamertag);
       } else {
@@ -584,6 +584,11 @@ class StateManager {
       Logger.error('repairState error', e);
     }
   }
+
+  // Returns all connected clients as [ws, clientData] pairs
+  getAllClients() {
+    return Array.from(this.clients.entries());
+  }
 }
 
 const stateManager = new StateManager();
@@ -677,12 +682,12 @@ function safeSendWithQueue(ws, gamertag, message) {
     if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify(message));
     }
-    
+
     // Also queue for HTTP polling
     if (gamertag) {
       queueMessage(gamertag, message);
     }
-    
+
     return true;
   } catch (e) {
     Logger.error('safeSendWithQueue error', e);
@@ -787,6 +792,141 @@ async function validateToken(token) {
     Logger.error('Token validation error', e);
     return { valid: true }; // Fail open
   }
+}
+
+// =====================================================
+// SHARED MINECRAFT DATA PROCESSOR
+// =====================================================
+// Used by both WebSocket and HTTP handlers to avoid code duplication.
+// Returns { pttStatesArray, voiceStatesArray, voiceBroadcastCount }
+function processMinecraftData(playersRaw, configRaw) {
+  const players = Array.isArray(playersRaw) ? playersRaw : [];
+  const config = configRaw || {};
+  const maxDistance = config.maxDistance || 15;
+
+  // Distance calculation helper
+  const calculateDistance = (loc1, loc2) => {
+    try {
+      const dx = parseFloat(loc1.x) - parseFloat(loc2.x);
+      const dy = parseFloat(loc1.y) - parseFloat(loc2.y);
+      const dz = parseFloat(loc1.z) - parseFloat(loc2.z);
+      return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    } catch {
+      return 999999;
+    }
+  };
+
+  // --- 1. Update states ---
+  for (const player of players) {
+    try {
+      const gamertag = player?.name;
+      if (!gamertag) continue;
+      const pData = player?.data || {};
+      const clientInfo = stateManager.findClientByGamertag(gamertag);
+      if (clientInfo?.data?.forceMuted) continue;
+
+      stateManager.pttStates.set(gamertag, {
+        isTalking: Sanitizer.boolean(pData.isTalking),
+        isMuted: Sanitizer.boolean(pData.isMuted)
+      });
+      stateManager.voiceStates.set(gamertag, {
+        isTalking: Sanitizer.boolean(pData.isTalking),
+        volume: Sanitizer.number(pData.voiceVolume, -100, 0)
+      });
+    } catch { }
+  }
+
+  // --- 2. Broadcast voice-update to nearby players ---
+  let voiceBroadcastCount = 0;
+  for (const talker of players) {
+    try {
+      const talkerName = talker?.name;
+      if (!talkerName) continue;
+
+      const talkerData = talker?.data || {};
+      const isTalking = Sanitizer.boolean(talkerData.isTalking);
+      const isMuted = Sanitizer.boolean(talkerData.isMuted);
+      const volume = Sanitizer.number(talkerData.voiceVolume, -100, 0);
+
+      const talkerLocation = talker?.location;
+      if (!talkerLocation) continue;
+
+      // Check if talker is force muted
+      const talkerClient = stateManager.findClientByGamertag(talkerName);
+      if (talkerClient?.data?.forceMuted) continue;
+
+      // Determine effective talking state
+      const effectivelyTalking = isTalking && !isMuted;
+
+      // Broadcast to nearby players (both talking AND not-talking for stop notifications)
+      let listenersCount = 0;
+      for (const listener of players) {
+        try {
+          const listenerName = listener?.name;
+          if (!listenerName || listenerName === talkerName) continue;
+
+          const listenerData = listener?.data || {};
+          const isDeafened = Sanitizer.boolean(listenerData.isDeafened);
+          if (isDeafened) continue;
+
+          const listenerLocation = listener?.location;
+          if (!listenerLocation) continue;
+
+          const distance = calculateDistance(talkerLocation, listenerLocation);
+
+          if (distance < maxDistance) {
+            const voiceMessage = {
+              type: 'voice-update',
+              gamertag: talkerName,
+              isTalking: effectivelyTalking,
+              volume: effectivelyTalking ? volume : -100
+            };
+
+            // Queue for HTTP polling
+            queueMessage(listenerName, voiceMessage);
+
+            // Also send via WebSocket if connected
+            const listenerClient = stateManager.findClientByGamertag(listenerName);
+            if (listenerClient && listenerClient.ws) {
+              safeSend(listenerClient.ws, voiceMessage);
+            }
+
+            if (effectivelyTalking) {
+              listenersCount++;
+              voiceBroadcastCount++;
+            }
+          }
+        } catch (e) {
+          Logger.error(`Error broadcasting to listener`, e);
+        }
+      }
+
+      if (effectivelyTalking && listenersCount > 0) {
+        Logger.success(`🔊 [VOICE] ${talkerName} -> ${listenersCount} listener(s)`);
+      }
+    } catch (e) {
+      Logger.error(`Error processing talker`, e);
+    }
+  }
+
+  if (voiceBroadcastCount > 0) {
+    Logger.success(`📊 [VOICE] Total broadcasts: ${voiceBroadcastCount}`);
+  }
+
+  // --- 3. Build state arrays and broadcast minecraft-update ---
+  const pttStatesArray = Array.from(stateManager.pttStates.entries())
+    .map(([g, s]) => ({ gamertag: g, ...s }));
+  const voiceStatesArray = Array.from(stateManager.voiceStates.entries())
+    .map(([g, s]) => ({ gamertag: g, ...s }));
+
+  broadcastToAll({
+    type: 'minecraft-update',
+    data: minecraftData,
+    pttStates: pttStatesArray,
+    voiceStates: voiceStatesArray
+  });
+
+  return { pttStatesArray, voiceStatesArray, voiceBroadcastCount };
 }
 
 // =====================================================
@@ -1085,155 +1225,8 @@ const MessageHandlers = {
     try {
       if (data.players) {
         minecraftData = data.players;
-
-        const players = Array.isArray(data.players) ? data.players : [];
-        const config = data.config || {};
-        const maxDistance = config.maxDistance || 15;
-
-        // Helper function to calculate distance
-        const calculateDistance = (loc1, loc2) => {
-          try {
-            const dx = parseFloat(loc1.x) - parseFloat(loc2.x);
-            const dy = parseFloat(loc1.y) - parseFloat(loc2.y);
-            const dz = parseFloat(loc1.z) - parseFloat(loc2.z);
-            return Math.sqrt(dx * dx + dy * dy + dz * dz);
-          } catch {
-            return 999999;
-          }
-        };
-
-        // Update states
-        for (const player of players) {
-          try {
-            const gamertag = player?.name;
-            if (!gamertag) continue;
-            const pData = player?.data || {};
-            const clientInfo = stateManager.findClientByGamertag(gamertag);
-            if (clientInfo?.data?.forceMuted) continue;
-
-            stateManager.pttStates.set(gamertag, {
-              isTalking: Sanitizer.boolean(pData.isTalking),
-              isMuted: Sanitizer.boolean(pData.isMuted)
-            });
-            stateManager.voiceStates.set(gamertag, {
-              isTalking: Sanitizer.boolean(pData.isTalking),
-              volume: Sanitizer.number(pData.voiceVolume, -100, 0)
-            });
-          } catch { }
-        }
-
-        // CRITICAL FIX: Broadcast voice-update to nearby players
-        let voiceBroadcastCount = 0;
-        for (const talker of players) {
-          try {
-            const talkerName = talker?.name;
-            if (!talkerName) continue;
-
-            const talkerData = talker?.data || {};
-            const isTalking = Sanitizer.boolean(talkerData.isTalking);
-            const isMuted = Sanitizer.boolean(talkerData.isMuted);
-            const volume = Sanitizer.number(talkerData.voiceVolume, -100, 0);
-
-            // Log talker status
-            if (isTalking) {
-              Logger.info(`🎤 [VOICE] ${talkerName} is talking (volume: ${volume}dB, muted: ${isMuted})`);
-            }
-
-            // Check if talker is actually talking and not muted
-            if (!isTalking || isMuted) continue;
-
-            // Check if talker is force muted
-            const talkerClient = stateManager.findClientByGamertag(talkerName);
-            if (talkerClient?.data?.forceMuted) {
-              Logger.warn(`⚠️ [VOICE] ${talkerName} is force-muted, skipping broadcast`);
-              continue;
-            }
-
-            const talkerLocation = talker?.location;
-            if (!talkerLocation) {
-              Logger.warn(`⚠️ [VOICE] ${talkerName} has no location, skipping`);
-              continue;
-            }
-
-            Logger.info(`📡 [VOICE] Broadcasting ${talkerName}'s voice to nearby players...`);
-
-            // Find nearby players and send voice-update
-            let listenersCount = 0;
-            for (const listener of players) {
-              try {
-                const listenerName = listener?.name;
-                if (!listenerName || listenerName === talkerName) continue;
-
-                const listenerData = listener?.data || {};
-                const isDeafened = Sanitizer.boolean(listenerData.isDeafened);
-                if (isDeafened) {
-                  Logger.info(`   🔇 [VOICE] ${listenerName} is deafened, skipping`);
-                  continue;
-                }
-
-                const listenerLocation = listener?.location;
-                if (!listenerLocation) continue;
-
-                // Calculate distance
-                const distance = calculateDistance(talkerLocation, listenerLocation);
-
-                // If within range, send voice-update
-                if (distance < maxDistance) {
-                  const listenerClient = stateManager.findClientByGamertag(listenerName);
-                  
-                  // Always queue the message for HTTP polling
-                  const voiceMessage = {
-                    type: 'voice-update',
-                    gamertag: talkerName,
-                    isTalking: true,
-                    volume: volume
-                  };
-                  
-                  // Queue for HTTP polling (even if not connected via WebSocket)
-                  queueMessage(listenerName, voiceMessage);
-                  
-                  // Also send via WebSocket if connected
-                  if (listenerClient && listenerClient.ws) {
-                    safeSend(listenerClient.ws, voiceMessage);
-                  }
-                  
-                  listenersCount++;
-                  voiceBroadcastCount++;
-                  Logger.success(`   ✅ [VOICE] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
-                } else {
-                  Logger.info(`   📏 [VOICE] ${listenerName} too far (${distance.toFixed(1)} > ${maxDistance} blocks)`);
-                }
-              } catch (e) {
-                Logger.error(`Error broadcasting to listener`, e);
-              }
-            }
-            
-            if (listenersCount > 0) {
-              Logger.success(`🔊 [VOICE] ${talkerName} voice sent to ${listenersCount} listener(s)`);
-            } else {
-              Logger.warn(`⚠️ [VOICE] ${talkerName} has no listeners nearby`);
-            }
-          } catch (e) {
-            Logger.error(`Error processing talker`, e);
-          }
-        }
-        
-        if (voiceBroadcastCount > 0) {
-          Logger.success(`📊 [VOICE] Total voice broadcasts: ${voiceBroadcastCount}`);
-        }
-
-        // Also send minecraft-update for compatibility
-        const pttStatesArray = Array.from(stateManager.pttStates.entries())
-          .map(([g, s]) => ({ gamertag: g, ...s }));
-        const voiceStatesArray = Array.from(stateManager.voiceStates.entries())
-          .map(([g, s]) => ({ gamertag: g, ...s }));
-
-        broadcastToAll({
-          type: 'minecraft-update',
-          data: minecraftData,
-          pttStates: pttStatesArray,
-          voiceStates: voiceStatesArray
-        });
+        const result = processMinecraftData(data.players, data.config);
+        // WS-specific: no response needed
       }
     } catch (e) {
       Logger.error('minecraftData WS error', e);
@@ -1382,161 +1375,145 @@ wss.on('error', (err) => {
 // HTTP ENDPOINTS
 // =====================================================
 
+// Generic HTTP POST handler - routes message types for HTTP polling clients
+// Used by mod's Socket.js._sendHTTP() which posts to root URL
+app.post("/", async (req, res) => {
+  try {
+    const data = Sanitizer.message(req.body);
+    if (!data || !data.type) {
+      return res.status(400).json({ error: 'Invalid message format' });
+    }
+
+    // Rate limit by IP
+    const clientIp = req.ip || req.socket?.remoteAddress || 'unknown';
+    const rateCheck = rateLimiter.check(`http_${clientIp}`);
+    if (!rateCheck.allowed) {
+      return res.status(429).json({ error: 'Rate limited' });
+    }
+
+    // Route based on message type
+    switch (data.type) {
+      case 'join': {
+        // Token validation for HTTP polling clients (no state manager storage)
+        let isSuspended = false;
+        let suspendMessage = null;
+        const responseMessages = [];
+
+        if (CONFIG.TOKEN_VALIDATION_ENABLED && data.token) {
+          const validation = await validateToken(data.token);
+
+          if (!validation.valid) {
+            return res.json({
+              success: false,
+              messages: [{ type: 'error', code: 'INVALID_TOKEN', message: 'Token غير صالح' }]
+            });
+          }
+
+          if (validation.suspended) {
+            isSuspended = true;
+            suspendMessage = validation.message || 'انتهت صلاحية الوصول المجاني. اختصر رابط لتجديد 48 ساعة.';
+          }
+        }
+
+        // Build response messages
+        responseMessages.push({
+          type: 'join-confirmed',
+          gamertag: data.gamertag,
+          voiceActive: !isSuspended,
+          forceMuted: isSuspended,
+          suspended: isSuspended,
+          message: isSuspended ? suspendMessage : null
+        });
+
+        if (isSuspended) {
+          responseMessages.push({
+            type: 'access-suspended',
+            message: suspendMessage,
+            expiresAt: null
+          });
+        }
+
+        responseMessages.push({
+          type: 'participants-list',
+          list: stateManager.getParticipants()
+        });
+
+        // Queue for polling
+        if (data.gamertag) {
+          for (const msg of responseMessages) {
+            queueMessage(data.gamertag, msg);
+          }
+        }
+
+        Logger.info(`HTTP join: ${data.gamertag} suspended=${isSuspended}`);
+        return res.json({ success: true, messages: responseMessages });
+      }
+
+      case 'check-access': {
+        // Token re-validation for HTTP polling clients
+        const responseMessages = [];
+
+        if (CONFIG.TOKEN_VALIDATION_ENABLED && data.token) {
+          const validation = await validateToken(data.token);
+
+          if (validation.valid && validation.suspended) {
+            responseMessages.push({
+              type: 'access-suspended',
+              message: validation.message || 'انتهت صلاحية الوصول المجاني.'
+            });
+          } else if (validation.valid && !validation.suspended) {
+            responseMessages.push({
+              type: 'access-restored',
+              message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
+            });
+          }
+        }
+
+        // Queue for polling
+        if (data.gamertag) {
+          for (const msg of responseMessages) {
+            queueMessage(data.gamertag, msg);
+          }
+        }
+
+        return res.json({ success: true, messages: responseMessages });
+      }
+
+      case 'minecraft-data':
+      case 'minecraftData': {
+        if (data.players) {
+          minecraftData = data.players;
+          const result = processMinecraftData(data.players, data.config);
+          return res.json({ success: true, pttStates: result.pttStatesArray, voiceStates: result.voiceStatesArray });
+        }
+        return res.json({ success: true });
+      }
+
+      case 'heartbeat':
+        return res.json({ type: 'heartbeat-ack' });
+
+      case 'request-participants':
+        return res.json({
+          type: 'participants-list',
+          list: stateManager.getParticipants()
+        });
+
+      default:
+        return res.json({ success: true });
+    }
+  } catch (e) {
+    Logger.error('HTTP POST handler error', e);
+    res.status(500).json({ error: 'Processing error' });
+  }
+});
+
 app.post("/minecraft-data", (req, res) => {
   try {
     minecraftData = req.body;
-
     const players = Array.isArray(minecraftData?.players) ? minecraftData.players : [];
-    const config = minecraftData?.config || {};
-    const maxDistance = config.maxDistance || 15;
+    const result = processMinecraftData(players, minecraftData?.config);
 
-    // Helper function to calculate distance
-    const calculateDistance = (loc1, loc2) => {
-      try {
-        const dx = parseFloat(loc1.x) - parseFloat(loc2.x);
-        const dy = parseFloat(loc1.y) - parseFloat(loc2.y);
-        const dz = parseFloat(loc1.z) - parseFloat(loc2.z);
-        return Math.sqrt(dx * dx + dy * dy + dz * dz);
-      } catch {
-        return 999999;
-      }
-    };
-
-    // Update states
-    for (const player of players) {
-      try {
-        const gamertag = player?.name;
-        if (!gamertag) continue;
-
-        const data = player?.data || {};
-        const clientInfo = stateManager.findClientByGamertag(gamertag);
-        if (clientInfo?.data?.forceMuted) continue;
-
-        stateManager.pttStates.set(gamertag, {
-          isTalking: Sanitizer.boolean(data.isTalking),
-          isMuted: Sanitizer.boolean(data.isMuted)
-        });
-        stateManager.voiceStates.set(gamertag, {
-          isTalking: Sanitizer.boolean(data.isTalking),
-          volume: Sanitizer.number(data.voiceVolume, -100, 0)
-        });
-      } catch { }
-    }
-
-    // CRITICAL FIX: Broadcast voice-update to nearby players
-    let voiceBroadcastCount = 0;
-    for (const talker of players) {
-      try {
-        const talkerName = talker?.name;
-        if (!talkerName) continue;
-
-        const talkerData = talker?.data || {};
-        const isTalking = Sanitizer.boolean(talkerData.isTalking);
-        const isMuted = Sanitizer.boolean(talkerData.isMuted);
-        const volume = Sanitizer.number(talkerData.voiceVolume, -100, 0);
-
-        // Log talker status
-        if (isTalking) {
-          Logger.info(`🎤 [VOICE-HTTP] ${talkerName} is talking (volume: ${volume}dB, muted: ${isMuted})`);
-        }
-
-        // Check if talker is actually talking and not muted
-        if (!isTalking || isMuted) continue;
-
-        // Check if talker is force muted
-        const talkerClient = stateManager.findClientByGamertag(talkerName);
-        if (talkerClient?.data?.forceMuted) {
-          Logger.warn(`⚠️ [VOICE-HTTP] ${talkerName} is force-muted, skipping broadcast`);
-          continue;
-        }
-
-        const talkerLocation = talker?.location;
-        if (!talkerLocation) {
-          Logger.warn(`⚠️ [VOICE-HTTP] ${talkerName} has no location, skipping`);
-          continue;
-        }
-
-        Logger.info(`📡 [VOICE-HTTP] Broadcasting ${talkerName}'s voice to nearby players...`);
-
-        // Find nearby players and send voice-update
-        let listenersCount = 0;
-        for (const listener of players) {
-          try {
-            const listenerName = listener?.name;
-            if (!listenerName || listenerName === talkerName) continue;
-
-            const listenerData = listener?.data || {};
-            const isDeafened = Sanitizer.boolean(listenerData.isDeafened);
-            if (isDeafened) {
-              Logger.info(`   🔇 [VOICE-HTTP] ${listenerName} is deafened, skipping`);
-              continue;
-            }
-
-            const listenerLocation = listener?.location;
-            if (!listenerLocation) continue;
-
-            // Calculate distance
-            const distance = calculateDistance(talkerLocation, listenerLocation);
-
-            // If within range, send voice-update
-            if (distance < maxDistance) {
-              const listenerClient = stateManager.findClientByGamertag(listenerName);
-              
-              // Always queue the message for HTTP polling
-              const voiceMessage = {
-                type: 'voice-update',
-                gamertag: talkerName,
-                isTalking: true,
-                volume: volume
-              };
-              
-              // Queue for HTTP polling (even if not connected via WebSocket)
-              queueMessage(listenerName, voiceMessage);
-              
-              // Also send via WebSocket if connected
-              if (listenerClient && listenerClient.ws) {
-                safeSend(listenerClient.ws, voiceMessage);
-              }
-              
-              listenersCount++;
-              voiceBroadcastCount++;
-              Logger.success(`   ✅ [VOICE-HTTP] ${talkerName} -> ${listenerName} (distance: ${distance.toFixed(1)} blocks)`);
-            } else {
-              Logger.info(`   📏 [VOICE-HTTP] ${listenerName} too far (${distance.toFixed(1)} > ${maxDistance} blocks)`);
-            }
-          } catch (e) {
-            Logger.error(`Error broadcasting to listener`, e);
-          }
-        }
-        
-        if (listenersCount > 0) {
-          Logger.success(`🔊 [VOICE-HTTP] ${talkerName} voice sent to ${listenersCount} listener(s)`);
-        } else {
-          Logger.warn(`⚠️ [VOICE-HTTP] ${talkerName} has no listeners nearby`);
-        }
-      } catch (e) {
-        Logger.error(`Error processing talker`, e);
-      }
-    }
-    
-    if (voiceBroadcastCount > 0) {
-      Logger.success(`📊 [VOICE-HTTP] Total voice broadcasts: ${voiceBroadcastCount}`);
-    }
-
-    // Also send minecraft-update for compatibility
-    const pttStatesArray = Array.from(stateManager.pttStates.entries())
-      .map(([g, s]) => ({ gamertag: g, ...s }));
-    const voiceStatesArray = Array.from(stateManager.voiceStates.entries())
-      .map(([g, s]) => ({ gamertag: g, ...s }));
-
-    broadcastToAll({
-      type: 'minecraft-update',
-      data: minecraftData,
-      pttStates: pttStatesArray,
-      voiceStates: voiceStatesArray
-    });
-
-    res.json({ success: true, pttStates: pttStatesArray, voiceStates: voiceStatesArray });
+    res.json({ success: true, pttStates: result.pttStatesArray, voiceStates: result.voiceStatesArray });
   } catch (e) {
     Logger.error('minecraft-data error', e);
     res.status(500).json({ error: 'Processing error' });
@@ -1572,25 +1549,25 @@ app.get("/health", (req, res) => {
 app.get("/poll/:gamertag", (req, res) => {
   try {
     const gamertag = req.params.gamertag;
-    
+
     if (!gamertag || typeof gamertag !== 'string') {
       return res.status(400).json({ error: 'Invalid gamertag' });
     }
-    
+
     // Get messages from queue
     const messages = messageQueues.get(gamertag) || [];
-    
+
     // Clear queue after reading
     messageQueues.delete(gamertag);
-    
+
     // Remove timestamp from messages before sending
     const cleanMessages = messages.map(msg => {
       const { timestamp, ...rest } = msg;
       return rest;
     });
-    
+
     Logger.info(`📥 [POLL] ${gamertag} polled, ${cleanMessages.length} message(s)`);
-    
+
     res.json(cleanMessages);
   } catch (e) {
     Logger.error('poll error', e);
@@ -1665,6 +1642,73 @@ setInterval(() => {
     stateManager.repairState();
   } catch { }
 }, 300000);
+
+// Periodic access sweep - re-validate all connected clients (every 10 minutes)
+setInterval(async () => {
+  try {
+    if (!CONFIG.TOKEN_VALIDATION_ENABLED) return;
+
+    const clients = stateManager.getAllClients ? stateManager.getAllClients() : [];
+    let checked = 0;
+
+    for (const [ws, clientData] of clients) {
+      try {
+        const token = ws._accessToken;
+        if (!token) continue;
+
+        const validation = await validateToken(token);
+        const wasSuspended = clientData.isSuspended;
+        const isNowSuspended = validation.valid && validation.suspended;
+
+        if (wasSuspended !== isNowSuspended) {
+          clientData.isSuspended = isNowSuspended;
+          clientData.voiceActive = !isNowSuspended && stateManager.canActivateVoice();
+          clientData.forceMuted = isNowSuspended || !clientData.voiceActive;
+
+          Logger.info(`[ACCESS_SWEEP] ${clientData.gamertag}: suspended=${wasSuspended}->${isNowSuspended}`);
+
+          if (wasSuspended && !isNowSuspended) {
+            safeSend(ws, {
+              type: 'access-restored',
+              message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
+            });
+            // Also queue for HTTP polling
+            if (clientData.gamertag) {
+              queueMessage(clientData.gamertag, {
+                type: 'access-restored',
+                message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
+              });
+            }
+            broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+          } else if (!wasSuspended && isNowSuspended) {
+            const msg = validation.message || 'انتهت صلاحية الوصول المجاني.';
+            safeSend(ws, {
+              type: 'access-suspended',
+              message: msg
+            });
+            // Also queue for HTTP polling
+            if (clientData.gamertag) {
+              queueMessage(clientData.gamertag, {
+                type: 'access-suspended',
+                message: msg
+              });
+            }
+            broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+          }
+        }
+        checked++;
+      } catch (e) {
+        Logger.error(`Access sweep error for ${clientData?.gamertag}`, e);
+      }
+    }
+
+    if (checked > 0) {
+      Logger.info(`[ACCESS_SWEEP] Checked ${checked} client(s)`);
+    }
+  } catch (e) {
+    Logger.error('Access sweep error', e);
+  }
+}, 600000); // 10 minutes
 
 // =====================================================
 // GRACEFUL SHUTDOWN
