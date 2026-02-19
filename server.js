@@ -921,7 +921,7 @@ function processMinecraftData(playersRaw, configRaw) {
 
   broadcastToAll({
     type: 'minecraft-update',
-    data: minecraftData,
+    data: playersRaw,
     pttStates: pttStatesArray,
     voiceStates: voiceStatesArray
   });
@@ -1509,9 +1509,9 @@ app.post("/", async (req, res) => {
 
 app.post("/minecraft-data", (req, res) => {
   try {
-    minecraftData = req.body;
-    const players = Array.isArray(minecraftData?.players) ? minecraftData.players : [];
-    const result = processMinecraftData(players, minecraftData?.config);
+    const players = Array.isArray(req.body?.players) ? req.body.players : [];
+    minecraftData = players;
+    const result = processMinecraftData(players, req.body?.config);
 
     res.json({ success: true, pttStates: result.pttStatesArray, voiceStates: result.voiceStatesArray });
   } catch (e) {
