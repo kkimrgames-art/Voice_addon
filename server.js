@@ -938,23 +938,28 @@ const MessageHandlers = {
       let isSuspended = false;
       let suspendMessage = null;
 
+      Logger.info(`🤝 [JOIN] Attempt gamertag=${data.gamertag} token=${data.token ? 'present' : 'missing'}`);
+
       // Token validation
       if (CONFIG.TOKEN_VALIDATION_ENABLED && data.token) {
+        Logger.info(`🔑 [JOIN] Validating token for ${data.gamertag}...`);
         const validation = await validateToken(data.token);
 
         // Handle suspended access (48h expired)
         if (validation.valid && validation.suspended) {
           isSuspended = true;
           suspendMessage = validation.message || 'انتهت صلاحية الوصول المجاني. اختصر رابط لتجديد 48 ساعة.';
-          Logger.info(`Suspended user connecting: token valid but access expired`);
+          Logger.warn(`⏸️ [JOIN] User ${data.gamertag} is SUSPENDED (expired)`);
         }
 
         if (!validation.valid) {
+          Logger.error(`🚫 [JOIN] Invalid token for ${data.gamertag}: ${validation.message || 'unknown'}`);
           safeSend(ws, { type: 'error', code: 'INVALID_TOKEN', message: 'Token غير صالح' });
           ws.close(1008, 'Invalid token');
           return { success: false };
         }
 
+        Logger.success(`✅ [JOIN] Token validated for ${data.gamertag}`);
         // Store token for periodic checks
         ws._accessToken = data.token;
       }
@@ -971,7 +976,7 @@ const MessageHandlers = {
         }
       }
 
-      Logger.success(`${result.gamertag} joined (${stateManager.connectionCount}/${CONFIG.MAX_CONNECTIONS}) voice=${!isSuspended && result.voiceActive} suspended=${isSuspended}`);
+      Logger.success(`👤 [JOIN] ${result.gamertag} joined (Total: ${stateManager.connectionCount}/${CONFIG.MAX_CONNECTIONS}) voice=${!isSuspended && result.voiceActive} suspended=${isSuspended}`);
 
       // Confirmation with suspension info
       safeSend(ws, {
@@ -1088,13 +1093,17 @@ const MessageHandlers = {
       const client = stateManager.getClient(ws);
       if (client && client.isSuspended) return;
 
-      if (!data.to || !data.from) return;
+      if (!data.to || !data.from) {
+        Logger.warn(`⚠️ [RELAY] Signal missing from/to: ${JSON.stringify(data)}`);
+        return;
+      }
+
       const target = stateManager.findClientByGamertag(data.to);
       if (target) {
-        debugLog(`signal type=${data.type} from=${data.from} to=${data.to}`);
+        Logger.success(`📡 [RELAY] type=${data.type} from=${data.from} -> to=${data.to}`);
         safeSend(target.ws, data);
       } else {
-        debugLog(`signal drop type=${data.type} from=${data.from} to=${data.to} reason=target_not_found`);
+        Logger.error(`❌ [RELAY] Target not found: type=${data.type} from=${data.from} to=${data.to}`);
       }
     } catch (e) {
       Logger.error('webrtcSignaling error', e);
@@ -1242,7 +1251,10 @@ wss.on("connection", (ws, req) => {
   let clientId = `c_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
 
   try {
-    debugLog(`connection open id=${clientId} ip=${req?.socket?.remoteAddress || 'unknown'}`);
+    const ip = req?.socket?.remoteAddress || 'unknown';
+    const forwarded = req.headers['x-forwarded-for'];
+    const origin = req.headers['origin'];
+    Logger.info(`🔌 [WS] Connection Attempt: id=${clientId} ip=${ip} forwarded=${forwarded} origin=${origin}`);
   } catch {
   }
 
@@ -1281,18 +1293,28 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
+      // Log every message raw
+      try {
+        const strMsg = msg.toString();
+        // Don't log heartbeats as they are too spammy
+        if (!strMsg.includes('"type":"heartbeat"')) {
+          Logger.success(`📥 [RX] Raw Message: id=${clientId} gamertag=${gamertag || 'none'} msg=${strMsg}`);
+        }
+      } catch { }
+
       // Parse
       const data = Sanitizer.message(JSON.parse(msg.toString()));
-      if (!data) return;
+      if (!data) {
+        Logger.warn(`⚠️ [MSG] Sanitizer rejected message from ${gamertag || clientId}`);
+        return;
+      }
 
       try {
-        if (CONFIG.DEBUG_LOGS) {
-          const sender = stateManager.getClient(ws);
-          const from = data.from || data.gamertag || sender?.gamertag || gamertag || clientId;
-          const to = data.to || '';
-          const t = data.type || 'unknown';
-          debugLog(`rx type=${t} from=${from}${to ? ` to=${to}` : ''}`);
-        }
+        const sender = stateManager.getClient(ws);
+        const from = data.from || data.gamertag || sender?.gamertag || gamertag || clientId;
+        const to = data.to || '';
+        const t = data.type || 'unknown';
+        Logger.info(`🔍 [ROUTE] type=${t} from=${from}${to ? ` to=${to}` : ''}`);
       } catch {
       }
 
