@@ -355,6 +355,7 @@ class StateManager {
     this.activeVoiceCount = 0;
     this.gamertagIndex = new Map(); // gamertag -> ws for fast lookup
     this.lastBroadcastTimes = new Map(); // gamertag -> timestamp
+    this.roomIndex = new Map(); // roomId -> Set<ws> for room-based isolation
   }
 
   get connectionCount() {
@@ -377,7 +378,7 @@ class StateManager {
     }
   }
 
-  addClient(ws, gamertag) {
+  addClient(ws, gamertag, roomId) {
     try {
       // Validate
       const cleanTag = Sanitizer.gamertag(gamertag);
@@ -391,9 +392,11 @@ class StateManager {
       }
 
       const canVoice = this.canActivateVoice();
+      const safeRoomId = String(roomId || 'default').substring(0, 100);
 
       const clientData = {
         gamertag: cleanTag,
+        roomId: safeRoomId,
         joinedAt: Date.now(),
         voiceActive: canVoice,
         forceMuted: !canVoice
@@ -402,6 +405,13 @@ class StateManager {
       this.clients.set(ws, clientData);
       this.gamertagIndex.set(cleanTag, ws);
 
+      // Add to room index
+      if (!this.roomIndex.has(safeRoomId)) {
+        this.roomIndex.set(safeRoomId, new Set());
+      }
+      this.roomIndex.get(safeRoomId).add(ws);
+      Logger.info(`🏠 [ROOM] ${cleanTag} joined room: ${safeRoomId} (${this.roomIndex.get(safeRoomId).size} in room)`);
+
       if (canVoice) {
         this.activeVoiceCount++;
       }
@@ -409,7 +419,7 @@ class StateManager {
       this.pttStates.set(cleanTag, { isTalking: false, isMuted: !canVoice });
       this.voiceStates.set(cleanTag, { isTalking: false, volume: 0 });
 
-      return { voiceActive: canVoice, gamertag: cleanTag };
+      return { voiceActive: canVoice, gamertag: cleanTag, roomId: safeRoomId };
     } catch (e) {
       if (e.message === 'INVALID_GAMERTAG' || e.message === 'GAMERTAG_IN_USE') {
         throw e;
@@ -426,6 +436,17 @@ class StateManager {
 
       if (data.voiceActive) {
         this.activeVoiceCount = Math.max(0, this.activeVoiceCount - 1);
+      }
+
+      // Remove from room index
+      if (data.roomId && this.roomIndex.has(data.roomId)) {
+        this.roomIndex.get(data.roomId).delete(ws);
+        const remaining = this.roomIndex.get(data.roomId).size;
+        Logger.info(`🏠 [ROOM] ${data.gamertag} left room: ${data.roomId} (${remaining} remaining)`);
+        if (remaining === 0) {
+          this.roomIndex.delete(data.roomId);
+          Logger.info(`🏠 [ROOM] Room ${data.roomId} dissolved (empty)`);
+        }
       }
 
       this.pttStates.delete(data.gamertag);
@@ -449,21 +470,38 @@ class StateManager {
     }
   }
 
-  getParticipants() {
+  getParticipants(roomId) {
     try {
+      if (roomId) {
+        return Array.from(this.clients.values())
+          .filter(c => c.roomId === roomId)
+          .map(c => c.gamertag);
+      }
       return Array.from(this.clients.values()).map(c => c.gamertag);
     } catch {
       return [];
     }
   }
 
-  getParticipantsWithStatus() {
+  getParticipantsWithStatus(roomId) {
     try {
-      return Array.from(this.clients.values()).map(c => ({
+      let entries = Array.from(this.clients.values());
+      if (roomId) entries = entries.filter(c => c.roomId === roomId);
+      return entries.map(c => ({
         gamertag: c.gamertag,
         voiceActive: c.voiceActive,
         forceMuted: c.forceMuted
       }));
+    } catch {
+      return [];
+    }
+  }
+
+  getClientsInRoom(roomId) {
+    try {
+      const wsSet = this.roomIndex.get(roomId);
+      if (!wsSet) return [];
+      return Array.from(wsSet).map(ws => ({ ws, data: this.clients.get(ws) })).filter(c => c.data);
     } catch {
       return [];
     }
@@ -699,24 +737,32 @@ function safeSendWithQueue(ws, gamertag, message) {
   return false;
 }
 
-function broadcast(senderWs, message) {
+function broadcastToRoomExcept(senderWs, message) {
   try {
+    // Room-scoped broadcast (exclude sender)
+    const senderData = stateManager.getClient(senderWs);
+    const roomId = senderData?.roomId;
+    if (!roomId) {
+      Logger.warn(`broadcastToRoomExcept: sender has no roomId, skipping`);
+      return;
+    }
     const msg = JSON.stringify(message);
-    for (const client of wss.clients) {
+    const roomClients = stateManager.getClientsInRoom(roomId);
+    for (const { ws: client } of roomClients) {
       if (client !== senderWs && client.readyState === 1) {
         try {
           client.send(msg);
         } catch (e) {
           try {
             const toClient = stateManager.getClient(client);
-            debugLog(`broadcast failed to=${toClient?.gamertag || 'unknown'} type=${message?.type || 'unknown'} err=${e?.message || e}`);
+            debugLog(`broadcastToRoomExcept failed to=${toClient?.gamertag || 'unknown'} type=${message?.type || 'unknown'} err=${e?.message || e}`);
           } catch {
           }
         }
       }
     }
   } catch (e) {
-    Logger.error('broadcast error', e);
+    Logger.error('broadcastToRoomExcept error', e);
   }
 }
 
@@ -738,6 +784,30 @@ function broadcastToAll(message) {
     }
   } catch (e) {
     Logger.error('broadcastToAll error', e);
+  }
+}
+
+// Room-scoped broadcast (to all in room including sender)
+function broadcastToRoom(roomId, message) {
+  try {
+    if (!roomId) return;
+    const msg = JSON.stringify(message);
+    const roomClients = stateManager.getClientsInRoom(roomId);
+    for (const { ws: client } of roomClients) {
+      if (client.readyState === 1) {
+        try {
+          client.send(msg);
+        } catch (e) {
+          try {
+            const toClient = stateManager.getClient(client);
+            debugLog(`broadcastToRoom failed to=${toClient?.gamertag || 'unknown'} room=${roomId} type=${message?.type || 'unknown'}`);
+          } catch {
+          }
+        }
+      }
+    }
+  } catch (e) {
+    Logger.error('broadcastToRoom error', e);
   }
 }
 
@@ -799,7 +869,7 @@ async function validateToken(token) {
 // =====================================================
 // Used by both WebSocket and HTTP handlers to avoid code duplication.
 // Returns { pttStatesArray, voiceStatesArray, voiceBroadcastCount }
-function processMinecraftData(playersRaw, configRaw) {
+function processMinecraftData(playersRaw, configRaw, roomId) {
   const players = Array.isArray(playersRaw) ? playersRaw : [];
   const config = configRaw || {};
   const maxDistance = config.maxDistance || 15;
@@ -919,7 +989,7 @@ function processMinecraftData(playersRaw, configRaw) {
   const voiceStatesArray = Array.from(stateManager.voiceStates.entries())
     .map(([g, s]) => ({ gamertag: g, ...s }));
 
-  broadcastToAll({
+  broadcastToRoom(roomId, {
     type: 'minecraft-update',
     data: playersRaw,
     pttStates: pttStatesArray,
@@ -964,7 +1034,7 @@ const MessageHandlers = {
         ws._accessToken = data.token;
       }
 
-      const result = stateManager.addClient(ws, data.gamertag);
+      const result = stateManager.addClient(ws, data.gamertag, data.roomId);
 
       // If suspended, override voiceActive to false
       if (isSuspended) {
@@ -1000,13 +1070,13 @@ const MessageHandlers = {
       // Participants
       safeSend(ws, {
         type: 'participants-list',
-        list: stateManager.getParticipants(),
-        detailed: stateManager.getParticipantsWithStatus()
+        list: stateManager.getParticipants(result.roomId),
+        detailed: stateManager.getParticipantsWithStatus(result.roomId)
       });
 
       // Broadcast
-      broadcast(ws, { type: 'join', gamertag: result.gamertag, voiceActive: !isSuspended && result.voiceActive });
-      broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+      broadcastToRoomExcept(ws, { type: 'join', gamertag: result.gamertag, voiceActive: !isSuspended && result.voiceActive });
+      broadcastToRoom(result.roomId, { type: 'participants-list', list: stateManager.getParticipants(result.roomId) });
 
       return { success: true, gamertag: result.gamertag, suspended: isSuspended };
     } catch (e) {
@@ -1027,11 +1097,13 @@ const MessageHandlers = {
 
   leave(ws) {
     try {
+      const client = stateManager.getClient(ws);
+      const roomId = client?.roomId;
       const gamertag = stateManager.removeClient(ws);
-      if (gamertag) {
-        Logger.info(`${gamertag} left - ${stateManager.connectionCount} remaining`);
-        broadcast(ws, { type: 'leave', gamertag });
-        broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+      if (gamertag && roomId) {
+        Logger.info(`${gamertag} left room ${roomId} - ${stateManager.connectionCount} total remaining`);
+        broadcastToRoom(roomId, { type: 'leave', gamertag });
+        broadcastToRoom(roomId, { type: 'participants-list', list: stateManager.getParticipants(roomId) });
       }
     } catch (e) {
       Logger.error('leave handler error', e);
@@ -1055,8 +1127,8 @@ const MessageHandlers = {
 
       // 3. Update State
       if (stateManager.updateVoiceState(data.gamertag, isTalking, volume)) {
-        // 4. Broadcast to others
-        broadcastToAll({
+        // 4. Broadcast to others in room
+        broadcastToRoom(client.roomId, {
           type: 'voice-update',
           gamertag: data.gamertag,
           isTalking: isTalking,
@@ -1075,7 +1147,7 @@ const MessageHandlers = {
       if (client && client.isSuspended) return;
 
       if (stateManager.updatePttState(data.gamertag, data.isTalking, data.isMuted)) {
-        broadcastToAll({
+        broadcastToRoom(client.roomId, {
           type: 'ptt-update',
           gamertag: data.gamertag,
           isTalking: Sanitizer.boolean(data.isTalking),
@@ -1100,7 +1172,13 @@ const MessageHandlers = {
 
       const target = stateManager.findClientByGamertag(data.to);
       if (target) {
-        Logger.success(`📡 [RELAY] type=${data.type} from=${data.from} -> to=${data.to}`);
+        // ROOM ISOLATION CHECK
+        if (target.data.roomId !== client.roomId) {
+          Logger.error(`❌ [RELAY] Cross-room signaling attempt blocked: ${client.gamertag} (${client.roomId}) -> ${target.data.gamertag} (${target.data.roomId})`);
+          return;
+        }
+
+        Logger.success(`📡 [RELAY] type=${data.type} from=${data.from} -> to=${data.to} (Room: ${client.roomId})`);
         safeSend(target.ws, data);
       } else {
         Logger.error(`❌ [RELAY] Target not found: type=${data.type} from=${data.from} to=${data.to}`);
@@ -1115,9 +1193,11 @@ const MessageHandlers = {
   },
 
   requestParticipants(ws) {
+    const client = stateManager.getClient(ws);
+    if (!client) return;
     safeSend(ws, {
       type: 'participants-list',
-      list: stateManager.getParticipants()
+      list: stateManager.getParticipants(client.roomId)
     });
   },
 
@@ -1148,14 +1228,14 @@ const MessageHandlers = {
             type: 'access-restored',
             message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
           });
-          broadcast(ws, { type: 'join', gamertag: client.gamertag, voiceActive: client.voiceActive });
-          broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+          broadcastToRoom(client.roomId, { type: 'join', gamertag: client.gamertag, voiceActive: client.voiceActive });
+          broadcastToRoom(client.roomId, { type: 'participants-list', list: stateManager.getParticipants(client.roomId) });
         } else if (!wasSuspended && isNowSuspended) {
           safeSend(ws, {
             type: 'access-suspended',
             message: validation.message || 'انتهت صلاحية الوصول المجاني.'
           });
-          broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+          broadcastToRoom(client.roomId, { type: 'participants-list', list: stateManager.getParticipants(client.roomId) });
         }
       }
     } catch (e) {
@@ -1201,7 +1281,7 @@ const MessageHandlers = {
             targetClient.data.forceMuted = true;
             targetClient.data.voiceActive = false;
             safeSend(targetClient.ws, { type: 'mute-notification', muted: true, reason });
-            broadcastToAll({ type: 'participants-list', list: stateManager.getParticipants(), detailed: stateManager.getParticipantsWithStatus() });
+            broadcastToRoom(targetClient.data.roomId, { type: 'participants-list', list: stateManager.getParticipants(targetClient.data.roomId), detailed: stateManager.getParticipantsWithStatus(targetClient.data.roomId) });
           }
           break;
         case 'unmute':
@@ -1209,11 +1289,14 @@ const MessageHandlers = {
             targetClient.data.forceMuted = false;
             targetClient.data.voiceActive = true;
             safeSend(targetClient.ws, { type: 'mute-notification', muted: false });
-            broadcastToAll({ type: 'participants-list', list: stateManager.getParticipants(), detailed: stateManager.getParticipantsWithStatus() });
+            broadcastToRoom(targetClient.data.roomId, { type: 'participants-list', list: stateManager.getParticipants(targetClient.data.roomId), detailed: stateManager.getParticipantsWithStatus(targetClient.data.roomId) });
           }
           break;
         case 'broadcast':
-          broadcastToAll({ type: 'admin-broadcast', message: reason || 'تنبيه من المسؤول' });
+          const admin = stateManager.getClient(ws);
+          if (admin) {
+            broadcastToRoom(admin.roomId, { type: 'admin-broadcast', message: reason || 'تنبيه من المسؤول' });
+          }
           break;
       }
     } catch (e) {
@@ -1233,8 +1316,10 @@ const MessageHandlers = {
   minecraftData(ws, data) {
     try {
       if (data.players) {
+        const client = stateManager.getClient(ws);
+        const roomId = client?.roomId || 'global';
         minecraftData = data.players;
-        const result = processMinecraftData(data.players, data.config);
+        const result = processMinecraftData(data.players, data.config, roomId);
         // WS-specific: no response needed
       }
     } catch (e) {
