@@ -21,8 +21,10 @@ let minecraftData = null;
 // MESSAGE QUEUE FOR HTTP POLLING
 // =====================================================
 const messageQueues = new Map();  // gamertag -> messages[]
+const httpPollingClients = new Map(); // gamertag -> client data
 const MAX_QUEUE_SIZE = 50;  // Maximum messages per player
 const QUEUE_CLEANUP_INTERVAL = 30000;  // Clean old queues every 30s
+const HTTP_CLIENT_TTL_MS = 120000;
 
 // Add message to player's queue
 function queueMessage(gamertag, message) {
@@ -48,6 +50,156 @@ function queueMessage(gamertag, message) {
   }
 }
 
+function sanitizeRoomId(roomId) {
+  try {
+    return String(roomId || 'default').substring(0, 100);
+  } catch {
+    return 'default';
+  }
+}
+
+function extractWsToken(req) {
+  try {
+    const rawUrl = req?.url || '/';
+    const url = new URL(rawUrl, 'http://localhost');
+    return url.searchParams.get('token') || '';
+  } catch {
+    return '';
+  }
+}
+
+function getHttpPollingClient(gamertag) {
+  try {
+    const cleanTag = Sanitizer.gamertag(gamertag);
+    if (!cleanTag) return null;
+    return httpPollingClients.get(cleanTag) || null;
+  } catch {
+    return null;
+  }
+}
+
+function registerHttpPollingClient({ gamertag, roomId, token, isSuspended = false, voiceActive = true, forceMuted = false }) {
+  const cleanTag = Sanitizer.gamertag(gamertag);
+  if (!cleanTag) {
+    throw new Error('INVALID_GAMERTAG');
+  }
+
+  const safeRoomId = sanitizeRoomId(roomId);
+  const existing = httpPollingClients.get(cleanTag) || null;
+  const resolvedVoiceActive = !isSuspended && !!voiceActive;
+  const client = {
+    gamertag: cleanTag,
+    roomId: safeRoomId,
+    token: token || existing?.token || null,
+    isSuspended: !!isSuspended,
+    voiceActive: resolvedVoiceActive,
+    forceMuted: !!forceMuted || !!isSuspended || !resolvedVoiceActive,
+    lastSeen: Date.now()
+  };
+
+  httpPollingClients.set(cleanTag, client);
+  return { client, previousRoomId: existing?.roomId || null };
+}
+
+function touchHttpPollingClient(gamertag, updates = {}) {
+  try {
+    const existing = getHttpPollingClient(gamertag);
+    if (!existing) return null;
+
+    const next = {
+      ...existing,
+      ...updates,
+      roomId: sanitizeRoomId(updates.roomId ?? existing.roomId),
+      lastSeen: Date.now()
+    };
+
+    httpPollingClients.set(existing.gamertag, next);
+    return next;
+  } catch {
+    return null;
+  }
+}
+
+function removeHttpPollingClient(gamertag) {
+  try {
+    const existing = getHttpPollingClient(gamertag);
+    if (!existing) return null;
+    httpPollingClients.delete(existing.gamertag);
+    return existing;
+  } catch {
+    return null;
+  }
+}
+
+function getRoomParticipants(roomId) {
+  try {
+    const participants = new Set(stateManager.getParticipants(roomId));
+    const safeRoomId = roomId ? sanitizeRoomId(roomId) : null;
+
+    for (const client of httpPollingClients.values()) {
+      if (!safeRoomId || client.roomId === safeRoomId) {
+        participants.add(client.gamertag);
+      }
+    }
+
+    return Array.from(participants);
+  } catch {
+    return [];
+  }
+}
+
+function getRoomParticipantsWithStatus(roomId) {
+  try {
+    const detailed = new Map();
+    const safeRoomId = roomId ? sanitizeRoomId(roomId) : null;
+
+    for (const item of stateManager.getParticipantsWithStatus(roomId)) {
+      detailed.set(item.gamertag, item);
+    }
+
+    for (const client of httpPollingClients.values()) {
+      if (safeRoomId && client.roomId !== safeRoomId) continue;
+      if (!detailed.has(client.gamertag)) {
+        detailed.set(client.gamertag, {
+          gamertag: client.gamertag,
+          voiceActive: client.voiceActive,
+          forceMuted: client.forceMuted
+        });
+      }
+    }
+
+    return Array.from(detailed.values());
+  } catch {
+    return [];
+  }
+}
+
+function resolveRoomIdForHttpData(data) {
+  try {
+    const explicitRoom = data?.roomId;
+    if (explicitRoom) return sanitizeRoomId(explicitRoom);
+
+    const clientRoom = getHttpPollingClient(data?.gamertag)?.roomId;
+    if (clientRoom) return clientRoom;
+
+    const players = Array.isArray(data?.players) ? data.players : [];
+    for (const player of players) {
+      const gamertag = player?.name;
+      if (!gamertag) continue;
+
+      const wsClient = stateManager.findClientByGamertag(gamertag);
+      if (wsClient?.data?.roomId) return wsClient.data.roomId;
+
+      const httpClient = getHttpPollingClient(gamertag);
+      if (httpClient?.roomId) return httpClient.roomId;
+    }
+
+    return 'default';
+  } catch {
+    return 'default';
+  }
+}
+
 // Clean up old message queues
 setInterval(() => {
   try {
@@ -66,6 +218,30 @@ setInterval(() => {
     }
   } catch (e) {
     Logger.error('Failed to clean message queues', e);
+  }
+}, QUEUE_CLEANUP_INTERVAL);
+
+setInterval(() => {
+  try {
+    const now = Date.now();
+    const affectedRooms = new Set();
+
+    for (const [gamertag, client] of httpPollingClients.entries()) {
+      if ((now - (client.lastSeen || 0)) > HTTP_CLIENT_TTL_MS) {
+        httpPollingClients.delete(gamertag);
+        affectedRooms.add(client.roomId);
+      }
+    }
+
+    for (const roomId of affectedRooms) {
+      broadcastToRoom(roomId, {
+        type: 'participants-list',
+        list: getRoomParticipants(roomId),
+        detailed: getRoomParticipantsWithStatus(roomId)
+      });
+    }
+  } catch (e) {
+    Logger.error('Failed to clean HTTP polling clients', e);
   }
 }, QUEUE_CLEANUP_INTERVAL);
 
@@ -742,6 +918,7 @@ function broadcastToRoomExcept(senderWs, message) {
     // Room-scoped broadcast (exclude sender)
     const senderData = stateManager.getClient(senderWs);
     const roomId = senderData?.roomId;
+    const senderGamertag = senderData?.gamertag;
     if (!roomId) {
       Logger.warn(`broadcastToRoomExcept: sender has no roomId, skipping`);
       return;
@@ -759,6 +936,12 @@ function broadcastToRoomExcept(senderWs, message) {
           } catch {
           }
         }
+      }
+    }
+
+    for (const client of httpPollingClients.values()) {
+      if (client.roomId === roomId && client.gamertag !== senderGamertag) {
+        queueMessage(client.gamertag, message);
       }
     }
   } catch (e) {
@@ -788,12 +971,18 @@ function broadcastToAll(message) {
 }
 
 // Room-scoped broadcast (to all in room including sender)
-function broadcastToRoom(roomId, message) {
+function broadcastToRoom(roomId, message, options = {}) {
   try {
     if (!roomId) return;
+    const safeRoomId = sanitizeRoomId(roomId);
+    const excludeGamertag = options?.excludeGamertag || null;
     const msg = JSON.stringify(message);
-    const roomClients = stateManager.getClientsInRoom(roomId);
+    const roomClients = stateManager.getClientsInRoom(safeRoomId);
     for (const { ws: client } of roomClients) {
+      const clientData = stateManager.getClient(client);
+      if (excludeGamertag && clientData?.gamertag === excludeGamertag) {
+        continue;
+      }
       if (client.readyState === 1) {
         try {
           client.send(msg);
@@ -804,6 +993,12 @@ function broadcastToRoom(roomId, message) {
           } catch {
           }
         }
+      }
+    }
+
+    for (const client of httpPollingClients.values()) {
+      if (client.roomId === safeRoomId && client.gamertag !== excludeGamertag) {
+        queueMessage(client.gamertag, message);
       }
     }
   } catch (e) {
@@ -893,7 +1088,8 @@ function processMinecraftData(playersRaw, configRaw, roomId) {
       if (!gamertag) continue;
       const pData = player?.data || {};
       const clientInfo = stateManager.findClientByGamertag(gamertag);
-      if (clientInfo?.data?.forceMuted) continue;
+      const httpClientInfo = getHttpPollingClient(gamertag);
+      if (clientInfo?.data?.forceMuted || httpClientInfo?.forceMuted) continue;
 
       stateManager.pttStates.set(gamertag, {
         isTalking: Sanitizer.boolean(pData.isTalking),
@@ -1007,13 +1203,14 @@ const MessageHandlers = {
     try {
       let isSuspended = false;
       let suspendMessage = null;
+      const token = data.token || ws._connectionToken || '';
 
-      Logger.info(`🤝 [JOIN] Attempt gamertag=${data.gamertag} token=${data.token ? 'present' : 'missing'}`);
+      Logger.info(`🤝 [JOIN] Attempt gamertag=${data.gamertag} token=${token ? 'present' : 'missing'}`);
 
       // Token validation
-      if (CONFIG.TOKEN_VALIDATION_ENABLED && data.token) {
+      if (CONFIG.TOKEN_VALIDATION_ENABLED && token) {
         Logger.info(`🔑 [JOIN] Validating token for ${data.gamertag}...`);
-        const validation = await validateToken(data.token);
+        const validation = await validateToken(token);
 
         // Handle suspended access (48h expired)
         if (validation.valid && validation.suspended) {
@@ -1031,7 +1228,7 @@ const MessageHandlers = {
 
         Logger.success(`✅ [JOIN] Token validated for ${data.gamertag}`);
         // Store token for periodic checks
-        ws._accessToken = data.token;
+        ws._accessToken = token;
       }
 
       const result = stateManager.addClient(ws, data.gamertag, data.roomId);
@@ -1070,13 +1267,17 @@ const MessageHandlers = {
       // Participants
       safeSend(ws, {
         type: 'participants-list',
-        list: stateManager.getParticipants(result.roomId),
-        detailed: stateManager.getParticipantsWithStatus(result.roomId)
+        list: getRoomParticipants(result.roomId),
+        detailed: getRoomParticipantsWithStatus(result.roomId)
       });
 
       // Broadcast
       broadcastToRoomExcept(ws, { type: 'join', gamertag: result.gamertag, voiceActive: !isSuspended && result.voiceActive });
-      broadcastToRoom(result.roomId, { type: 'participants-list', list: stateManager.getParticipants(result.roomId) });
+      broadcastToRoom(result.roomId, {
+        type: 'participants-list',
+        list: getRoomParticipants(result.roomId),
+        detailed: getRoomParticipantsWithStatus(result.roomId)
+      });
 
       return { success: true, gamertag: result.gamertag, suspended: isSuspended };
     } catch (e) {
@@ -1103,7 +1304,11 @@ const MessageHandlers = {
       if (gamertag && roomId) {
         Logger.info(`${gamertag} left room ${roomId} - ${stateManager.connectionCount} total remaining`);
         broadcastToRoom(roomId, { type: 'leave', gamertag });
-        broadcastToRoom(roomId, { type: 'participants-list', list: stateManager.getParticipants(roomId) });
+        broadcastToRoom(roomId, {
+          type: 'participants-list',
+          list: getRoomParticipants(roomId),
+          detailed: getRoomParticipantsWithStatus(roomId)
+        });
       }
     } catch (e) {
       Logger.error('leave handler error', e);
@@ -1197,7 +1402,8 @@ const MessageHandlers = {
     if (!client) return;
     safeSend(ws, {
       type: 'participants-list',
-      list: stateManager.getParticipants(client.roomId)
+      list: getRoomParticipants(client.roomId),
+      detailed: getRoomParticipantsWithStatus(client.roomId)
     });
   },
 
@@ -1205,7 +1411,7 @@ const MessageHandlers = {
     try {
       if (!CONFIG.TOKEN_VALIDATION_ENABLED) return;
 
-      const token = data.token || ws._accessToken;
+      const token = data.token || ws._accessToken || ws._connectionToken;
       if (!token) return;
 
       const validation = await validateToken(token);
@@ -1229,13 +1435,21 @@ const MessageHandlers = {
             message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
           });
           broadcastToRoom(client.roomId, { type: 'join', gamertag: client.gamertag, voiceActive: client.voiceActive });
-          broadcastToRoom(client.roomId, { type: 'participants-list', list: stateManager.getParticipants(client.roomId) });
+          broadcastToRoom(client.roomId, {
+            type: 'participants-list',
+            list: getRoomParticipants(client.roomId),
+            detailed: getRoomParticipantsWithStatus(client.roomId)
+          });
         } else if (!wasSuspended && isNowSuspended) {
           safeSend(ws, {
             type: 'access-suspended',
             message: validation.message || 'انتهت صلاحية الوصول المجاني.'
           });
-          broadcastToRoom(client.roomId, { type: 'participants-list', list: stateManager.getParticipants(client.roomId) });
+          broadcastToRoom(client.roomId, {
+            type: 'participants-list',
+            list: getRoomParticipants(client.roomId),
+            detailed: getRoomParticipantsWithStatus(client.roomId)
+          });
         }
       }
     } catch (e) {
@@ -1281,7 +1495,7 @@ const MessageHandlers = {
             targetClient.data.forceMuted = true;
             targetClient.data.voiceActive = false;
             safeSend(targetClient.ws, { type: 'mute-notification', muted: true, reason });
-            broadcastToRoom(targetClient.data.roomId, { type: 'participants-list', list: stateManager.getParticipants(targetClient.data.roomId), detailed: stateManager.getParticipantsWithStatus(targetClient.data.roomId) });
+            broadcastToRoom(targetClient.data.roomId, { type: 'participants-list', list: getRoomParticipants(targetClient.data.roomId), detailed: getRoomParticipantsWithStatus(targetClient.data.roomId) });
           }
           break;
         case 'unmute':
@@ -1289,7 +1503,7 @@ const MessageHandlers = {
             targetClient.data.forceMuted = false;
             targetClient.data.voiceActive = true;
             safeSend(targetClient.ws, { type: 'mute-notification', muted: false });
-            broadcastToRoom(targetClient.data.roomId, { type: 'participants-list', list: stateManager.getParticipants(targetClient.data.roomId), detailed: stateManager.getParticipantsWithStatus(targetClient.data.roomId) });
+            broadcastToRoom(targetClient.data.roomId, { type: 'participants-list', list: getRoomParticipants(targetClient.data.roomId), detailed: getRoomParticipantsWithStatus(targetClient.data.roomId) });
           }
           break;
         case 'broadcast':
@@ -1334,6 +1548,7 @@ const MessageHandlers = {
 wss.on("connection", (ws, req) => {
   let gamertag = null;
   let clientId = `c_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  ws._connectionToken = extractWsToken(req);
 
   try {
     const ip = req?.socket?.remoteAddress || 'unknown';
@@ -1501,10 +1716,11 @@ app.post("/", async (req, res) => {
     // Route based on message type
     switch (data.type) {
       case 'join': {
-        // Token validation for HTTP polling clients (no state manager storage)
+        // Token validation for HTTP polling clients
         let isSuspended = false;
         let suspendMessage = null;
         const responseMessages = [];
+        const roomId = sanitizeRoomId(data.roomId);
 
         if (CONFIG.TOKEN_VALIDATION_ENABLED && data.token) {
           const validation = await validateToken(data.token);
@@ -1522,10 +1738,19 @@ app.post("/", async (req, res) => {
           }
         }
 
+        const registration = registerHttpPollingClient({
+          gamertag: data.gamertag,
+          roomId,
+          token: data.token,
+          isSuspended,
+          voiceActive: !isSuspended,
+          forceMuted: isSuspended
+        });
+
         // Build response messages
         responseMessages.push({
           type: 'join-confirmed',
-          gamertag: data.gamertag,
+          gamertag: registration.client.gamertag,
           voiceActive: !isSuspended,
           forceMuted: isSuspended,
           suspended: isSuspended,
@@ -1542,26 +1767,63 @@ app.post("/", async (req, res) => {
 
         responseMessages.push({
           type: 'participants-list',
-          list: stateManager.getParticipants()
+          list: getRoomParticipants(roomId),
+          detailed: getRoomParticipantsWithStatus(roomId)
         });
 
         // Queue for polling
-        if (data.gamertag) {
+        if (registration.client.gamertag) {
           for (const msg of responseMessages) {
-            queueMessage(data.gamertag, msg);
+            queueMessage(registration.client.gamertag, msg);
           }
         }
 
-        Logger.info(`HTTP join: ${data.gamertag} suspended=${isSuspended}`);
+        if (registration.previousRoomId && registration.previousRoomId !== roomId) {
+          broadcastToRoom(registration.previousRoomId, {
+            type: 'participants-list',
+            list: getRoomParticipants(registration.previousRoomId),
+            detailed: getRoomParticipantsWithStatus(registration.previousRoomId)
+          });
+        }
+
+        broadcastToRoom(roomId, {
+          type: 'join',
+          gamertag: registration.client.gamertag,
+          voiceActive: !isSuspended
+        }, { excludeGamertag: registration.client.gamertag });
+
+        broadcastToRoom(roomId, {
+          type: 'participants-list',
+          list: getRoomParticipants(roomId),
+          detailed: getRoomParticipantsWithStatus(roomId)
+        }, { excludeGamertag: registration.client.gamertag });
+
+        Logger.info(`HTTP join: ${registration.client.gamertag} room=${roomId} suspended=${isSuspended}`);
         return res.json({ success: true, messages: responseMessages });
       }
 
       case 'check-access': {
         // Token re-validation for HTTP polling clients
         const responseMessages = [];
+        const httpClient = getHttpPollingClient(data.gamertag);
+        const roomId = httpClient?.roomId || sanitizeRoomId(data.roomId);
+        let stateChanged = false;
 
         if (CONFIG.TOKEN_VALIDATION_ENABLED && data.token) {
           const validation = await validateToken(data.token);
+          const isSuspended = validation.valid && validation.suspended;
+          const previousSuspended = !!httpClient?.isSuspended;
+
+          if (httpClient) {
+            touchHttpPollingClient(data.gamertag, {
+              token: data.token,
+              isSuspended,
+              voiceActive: validation.valid && !isSuspended,
+              forceMuted: !validation.valid || isSuspended
+            });
+          }
+
+          stateChanged = previousSuspended !== isSuspended;
 
           if (validation.valid && validation.suspended) {
             responseMessages.push({
@@ -1583,14 +1845,41 @@ app.post("/", async (req, res) => {
           }
         }
 
+        if (stateChanged && roomId) {
+          broadcastToRoom(roomId, {
+            type: 'participants-list',
+            list: getRoomParticipants(roomId),
+            detailed: getRoomParticipantsWithStatus(roomId)
+          });
+        }
+
         return res.json({ success: true, messages: responseMessages });
+      }
+
+      case 'leave': {
+        const removed = removeHttpPollingClient(data.gamertag);
+        if (removed) {
+          broadcastToRoom(removed.roomId, { type: 'leave', gamertag: removed.gamertag }, { excludeGamertag: removed.gamertag });
+          broadcastToRoom(removed.roomId, {
+            type: 'participants-list',
+            list: getRoomParticipants(removed.roomId),
+            detailed: getRoomParticipantsWithStatus(removed.roomId)
+          });
+        }
+        return res.json({ success: true });
       }
 
       case 'minecraft-data':
       case 'minecraftData': {
         if (data.players) {
           minecraftData = data.players;
-          const result = processMinecraftData(data.players, data.config);
+          const roomId = resolveRoomIdForHttpData(data);
+          for (const player of data.players) {
+            if (player?.name) {
+              touchHttpPollingClient(player.name, { roomId });
+            }
+          }
+          const result = processMinecraftData(data.players, data.config, roomId);
           return res.json({ success: true, pttStates: result.pttStatesArray, voiceStates: result.voiceStatesArray });
         }
         return res.json({ success: true });
@@ -1599,11 +1888,15 @@ app.post("/", async (req, res) => {
       case 'heartbeat':
         return res.json({ type: 'heartbeat-ack' });
 
-      case 'request-participants':
+      case 'request-participants': {
+        touchHttpPollingClient(data.gamertag, { roomId: data.roomId });
+        const roomId = resolveRoomIdForHttpData(data);
         return res.json({
           type: 'participants-list',
-          list: stateManager.getParticipants()
+          list: getRoomParticipants(roomId),
+          detailed: getRoomParticipantsWithStatus(roomId)
         });
+      }
 
       default:
         return res.json({ success: true });
@@ -1618,7 +1911,13 @@ app.post("/minecraft-data", (req, res) => {
   try {
     const players = Array.isArray(req.body?.players) ? req.body.players : [];
     minecraftData = players;
-    const result = processMinecraftData(players, req.body?.config);
+    const roomId = resolveRoomIdForHttpData(req.body || {});
+    for (const player of players) {
+      if (player?.name) {
+        touchHttpPollingClient(player.name, { roomId });
+      }
+    }
+    const result = processMinecraftData(players, req.body?.config, roomId);
 
     res.json({ success: true, pttStates: result.pttStatesArray, voiceStates: result.voiceStatesArray });
   } catch (e) {
@@ -1652,14 +1951,16 @@ app.get("/health", (req, res) => {
   }
 });
 
-// HTTP Polling endpoint for Minecraft Bedrock (no WebSocket support)
-app.get("/poll/:gamertag", (req, res) => {
+function handlePollRequest(req, res) {
   try {
-    const gamertag = req.params.gamertag;
+    const gamertag = req.params.gamertag || req.query.gamertag;
+    const roomId = req.query.roomId;
 
     if (!gamertag || typeof gamertag !== 'string') {
       return res.status(400).json({ error: 'Invalid gamertag' });
     }
+
+    touchHttpPollingClient(gamertag, roomId ? { roomId } : {});
 
     // Get messages from queue
     const messages = messageQueues.get(gamertag) || [];
@@ -1680,7 +1981,11 @@ app.get("/poll/:gamertag", (req, res) => {
     Logger.error('poll error', e);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+}
+
+// HTTP Polling endpoint for Minecraft Bedrock (supports both /poll/:gamertag and /poll?gamertag=...)
+app.get("/poll/:gamertag", handlePollRequest);
+app.get("/poll", handlePollRequest);
 
 app.get("/ptt-states", (req, res) => {
   try {
@@ -1786,7 +2091,13 @@ setInterval(async () => {
                 message: 'تم تجديد صلاحية الوصول! يمكنك التحدث الآن.'
               });
             }
-            broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+            if (clientData.roomId) {
+              broadcastToRoom(clientData.roomId, {
+                type: 'participants-list',
+                list: getRoomParticipants(clientData.roomId),
+                detailed: getRoomParticipantsWithStatus(clientData.roomId)
+              });
+            }
           } else if (!wasSuspended && isNowSuspended) {
             const msg = validation.message || 'انتهت صلاحية الوصول المجاني.';
             safeSend(ws, {
@@ -1800,7 +2111,13 @@ setInterval(async () => {
                 message: msg
               });
             }
-            broadcast(ws, { type: 'participants-list', list: stateManager.getParticipants() });
+            if (clientData.roomId) {
+              broadcastToRoom(clientData.roomId, {
+                type: 'participants-list',
+                list: getRoomParticipants(clientData.roomId),
+                detailed: getRoomParticipantsWithStatus(clientData.roomId)
+              });
+            }
           }
         }
         checked++;
